@@ -4,12 +4,13 @@
 Usage (Windows):  py xc.py <command> [--yes]
 Commands:
   check      Verify the token with one cheap count request (~$0.005)
-  run        Do everything below (count, search, users, timelines, weights, export) in one go
+  run        Do everything (count, search, users, probe, phase2, export) in one go
   count      Count matching posts per query (1 request per query, ~$0.005 each)
   search     Collect seed posts for each query in config.json
   users      Sample authors from seed posts and fetch their profiles
-  timelines  Fetch recent posts of the sampled accounts
-  weights    Count each sampled account's matching posts (for sampling weights)
+  probe      Phase 1: count each sampled account's baseline / everyday / matching posts
+  phase2     Phase 2: pick a stratified subsample and fetch its pre-controversy posts
+  timelines  (optional, not in run) Fetch recent posts of the sampled accounts
   export     Build analysis.sqlite (pseudonymized) for analysis
   sync       Re-check stored posts/users against X and delete removed ones (costs money; needs --yes)
   purge      Delete raw.sqlite and analysis.sqlite (needs --yes)
@@ -101,8 +102,9 @@ def raw_db():
         PRIMARY KEY(query_name, start));
     CREATE TABLE IF NOT EXISTS search_day_state(query_name TEXT, start TEXT, quota INTEGER, n INTEGER,
         next_token TEXT, done INTEGER, PRIMARY KEY(query_name, start));
-    CREATE TABLE IF NOT EXISTS author_counts(user_id TEXT, query_name TEXT, n INTEGER,
-        PRIMARY KEY(user_id, query_name));
+    CREATE TABLE IF NOT EXISTS probe(user_id TEXT PRIMARY KEY, baseline_total INTEGER, baseline_daily INTEGER,
+        match_n INTEGER, fetched_at TEXT);
+    CREATE TABLE IF NOT EXISTS phase2(user_id TEXT PRIMARY KEY, pred_class TEXT, selected_at TEXT, status TEXT, n INTEGER);
     """)
     cols = [r[1] for r in con.execute("PRAGMA table_info(sample)")]
     if "query_name" not in cols:
@@ -212,9 +214,9 @@ def n_accounts(cfg, q):
 
 
 def estimate(cl, cfg):
+    """Max cost: seeds + phase 1 (profile + 3 counts per account) + phase 2 (baseline posts)."""
     p = cl.prices
-    per_acct = p.get("user", 0) + int(cfg.get("timeline_posts_per_account", 100)) * p.get("post", 0) \
-        + p.get("count_all_request", 0) * (cfg.get("search_endpoint") == "all")
+    per_p1 = p.get("user", 0) + 3 * p.get("count_all_request", 0)
     total = 0.0
     for q in cfg["queries"]:
         buckets = cl.con.execute("SELECT start, end, n FROM daily_counts WHERE query_name=? ORDER BY start",
@@ -223,21 +225,23 @@ def estimate(cl, cfg):
             seeds = sum(max(x, 10) for x in allocate(seed_cap(cfg, q), buckets) if x > 0)
         else:
             seeds = seed_cap(cfg, q)
-        total += seeds * p.get("post", 0) + n_accounts(cfg, q) * per_acct
+        total += seeds * p.get("post", 0) + n_accounts(cfg, q) * per_p1
+    total += int(cfg.get("phase2_accounts", 160)) * int(cfg.get("phase2_posts_per_account", 30)) * p.get("post", 0)
     return total
 
 
 def cmd_run(cl, cfg):
-    """count -> estimate -> search -> users -> timelines -> weights -> export, in one go."""
+    """count -> search -> users (phase 1 sample) -> probe -> phase2 -> export, in one go (ADR-0011)."""
     have = {r[0] for r in cl.con.execute("SELECT DISTINCT query_name FROM daily_counts")}
     if any(q["name"] not in have for q in cfg["queries"]):
         cmd_count(cl, cfg)
     print(f"\n最大見積もり ${estimate(cl, cfg):.2f}（予算上限 ${cl.budget:.2f}、ここまでの推定使用額 ${cl.spent():.2f}）")
-    print("予算上限に達した時点で自動停止します。Ctrl+C で中断しても、再実行すれば続きから再開します。\n")
+    print("予算上限に達した時点で自動停止します。Ctrl+C で中断しても、再実行すれば続きから再開します。")
+    print("件数確認APIには回数制限があるため、待ち時間を含めて数時間かかることがあります。PCはつけたままにしてください。\n")
     cmd_search(cl, cfg)
     cmd_users(cl, cfg)
-    cmd_timelines(cl, cfg)
-    cmd_weights(cl, cfg)
+    cmd_probe(cl, cfg)
+    cmd_phase2(cl, cfg)
     cmd_export(cl.con, cfg)
     print("\n完了しました。Claude に「終わった」と伝えてください。")
 
@@ -249,10 +253,11 @@ def cmd_check(cl, cfg):
           f"{d.get('meta', {}).get('total_tweet_count', '?'):,}")
 
 
-def count_query(cl, cfg, query):
-    """Return list of (start, end, n) day buckets for a query over the configured period."""
+def count_query(cl, cfg, query, start=None, end=None):
+    """Return list of (start, end, n) day buckets for a query over the configured period (or start/end)."""
     ep = "all" if cfg.get("search_endpoint") == "all" else "recent"
-    params = {"query": query, "granularity": "day", **time_params(cfg)}
+    window = {"start_time": start, "end_time": end} if start else time_params(cfg)
+    params = {"query": query, "granularity": "day", **{k: v for k, v in window.items() if v}}
     out, pages = [], 0
     while True:
         d = cl.get(f"/tweets/counts/{ep}", params, 0.02)
@@ -413,21 +418,92 @@ def cmd_timelines(cl, cfg):
     print("タイムライン取得完了。")
 
 
-def cmd_weights(cl, cfg):
-    """For each sampled account, count its matching posts in its stratum over the period.
-    Used for inverse-probability weighting: accounts with many matching posts were more likely sampled (ADR-0009)."""
+def cmd_probe(cl, cfg):
+    """Phase 1 measurements per sampled account, using count requests only (ADR-0011):
+    baseline_total = posts in the baseline window, baseline_daily = of those, posts with everyday words,
+    match_n = posts matching its stratum query in the study window (for sampling weights, ADR-0009)."""
     con = cl.con
     qmap = {q["name"]: q["query"] for q in cfg["queries"]}
-    todo = con.execute("""SELECT s.user_id, s.query_name FROM sample s
-        WHERE NOT EXISTS (SELECT 1 FROM author_counts a WHERE a.user_id=s.user_id AND a.query_name=s.query_name)""").fetchall()
-    for i, (uid, qn) in enumerate(todo, 1):
-        if qn not in qmap:
-            continue
-        n = sum(b[2] for b in count_query(cl, cfg, f"({qmap[qn]}) from:{uid}"))
-        con.execute("INSERT OR REPLACE INTO author_counts VALUES(?,?,?)", (uid, qn, n))
+    bs, be = cfg["baseline_start"], cfg["baseline_end"]
+    daily = "(" + " OR ".join(cfg["daily_words"]) + ")"
+    todo = con.execute("""SELECT s.user_id, s.query_name, u.created_at FROM sample s JOIN users u ON u.id=s.user_id
+        WHERE s.user_id NOT IN (SELECT user_id FROM probe) AND COALESCE(u.protected,0)=0""").fetchall()
+    for i, (uid, qn, created) in enumerate(todo, 1):
+        new = bool(created) and created >= be
+        tot = 0 if new else sum(b[2] for b in count_query(cl, cfg, f"from:{uid} -is:retweet", bs, be))
+        day = 0 if (new or tot == 0) else sum(b[2] for b in count_query(cl, cfg, f"from:{uid} {daily} -is:retweet", bs, be))
+        m = sum(b[2] for b in count_query(cl, cfg, f"({qmap[qn]}) from:{uid}")) if qn in qmap else None
+        con.execute("INSERT OR REPLACE INTO probe VALUES(?,?,?,?,?)", (uid, tot, day, m, now()))
+        con.commit()
+        if i % 25 == 0 or i == len(todo):
+            print(f"第1段階の計測 {i:,}/{len(todo):,}  推定使用額 ${cl.spent():.2f}")
+
+
+BIO_RE_CACHE = {}
+
+
+def phase1_class(cfg, created, bio, tot, day):
+    """Pre-registered phase-1 rule (ADR-0011). Returns specialized / general / low_activity."""
+    r = cfg["phase1_rule"]
+    pat = BIO_RE_CACHE.setdefault("p", re.compile("|".join(r["bio_patterns"])))
+    if created and created >= r["new_account_after"]:
+        return "specialized"
+    if pat.search(bio or ""):
+        return "specialized"
+    if tot is None or tot < int(r["min_baseline_posts"]):
+        return "low_activity"
+    return "specialized" if (day or 0) / tot < float(r["daily_ratio_threshold"]) else "general"
+
+
+def cmd_phase2(cl, cfg):
+    """Select the phase-2 subsample (stratified by group x predicted class) and fetch baseline posts."""
+    con = cl.con
+    if not con.execute("SELECT 1 FROM phase2 LIMIT 1").fetchone():
+        rng = random.Random(int(cfg.get("random_seed", 42)) + 1)
+        groups = [q["name"] for q in cfg["queries"]]
+        per_g = -(-int(cfg.get("phase2_accounts", 160)) // len(groups))
+        rows = con.execute("""SELECT s.user_id, s.query_name, u.created_at, u.description, p.baseline_total, p.baseline_daily
+            FROM sample s JOIN users u ON u.id=s.user_id JOIN probe p ON p.user_id=s.user_id""").fetchall()
+        picked = []
+        for g in groups:
+            by_c = {}
+            for uid, qn, cr, bio, tot, day in rows:
+                if qn == g:
+                    by_c.setdefault(phase1_class(cfg, cr, bio, tot, day), []).append(uid)
+            for v in by_c.values():
+                rng.shuffle(v)
+            take, classes = [], sorted(by_c)
+            while len(take) < per_g and any(by_c[c] for c in classes):  # round-robin across predicted classes
+                for c in classes:
+                    if by_c[c] and len(take) < per_g:
+                        take.append((by_c[c].pop(), c))
+            picked += take
+            print(f"  [{g}] 第2段階 {len(take)} 人（" + "、".join(f"{c}:{sum(1 for _, x in take if x == c)}" for c in classes) + "）")
+        con.executemany("INSERT INTO phase2 VALUES(?,?,?,?,?)", [(u, c, now(), None, None) for u, c in picked])
+        con.commit()
+    per = int(cfg.get("phase2_posts_per_account", 30))
+    price = cl.prices.get("post", 0)
+    todo = [r[0] for r in con.execute("SELECT user_id FROM phase2 WHERE status IS NULL")]
+    for i, uid in enumerate(todo, 1):
+        params = {"max_results": max(5, min(100, per)), "tweet.fields": TWEET_FIELDS, "exclude": "retweets",
+                  "start_time": cfg["baseline_start"], "end_time": cfg["baseline_end"]}
+        d = cl.get(f"/users/{uid}/tweets", params, per * price)
+        data = d.get("data", [])[:per]
+        cl.charge("users/tweets(baseline)", "post", len(d.get("data", [])))
+        source, status = "baseline", "ok"
+        if not data:  # no posts before the controversy (e.g. new account): judge from recent posts instead
+            params.pop("start_time"), params.pop("end_time")
+            d = cl.get(f"/users/{uid}/tweets", params, per * price)
+            data = d.get("data", [])[:per]
+            cl.charge("users/tweets(recent)", "post", len(d.get("data", [])))
+            source, status = "recent", ("recent" if data else "empty")
+        for t in data:
+            t.setdefault("author_id", uid)
+            store_post(con, t, source)
+        con.execute("UPDATE phase2 SET status=?, n=? WHERE user_id=?", (status, len(data), uid))
         con.commit()
         if i % 20 == 0 or i == len(todo):
-            print(f"重み用の件数 {i:,}/{len(todo):,}  推定使用額 ${cl.spent():.2f}")
+            print(f"第2段階の投稿取得 {i:,}/{len(todo):,}  推定使用額 ${cl.spent():.2f}")
 
 
 # ---------------------------------------------------------------- pseudonymized export
@@ -472,12 +548,13 @@ def cmd_export(con, cfg):
         tweet_count INTEGER, listed INTEGER, protected INTEGER, verified INTEGER,
         bio TEXT, bio_mention_count INTEGER, bio_has_url INTEGER, has_url INTEGER, has_location INTEGER,
         default_image INTEGER, name_keyword_hits TEXT, seed_queries TEXT, seed_post_count INTEGER,
-        timeline_status TEXT, timeline_n INTEGER, stratum TEXT, stratum_match_posts INTEGER);
+        timeline_status TEXT, timeline_n INTEGER, stratum TEXT, stratum_match_posts INTEGER,
+        baseline_total INTEGER, baseline_daily INTEGER, pred_class TEXT, phase2 INTEGER, phase2_n INTEGER);
     CREATE TABLE daily_counts(query_name TEXT, day TEXT, n INTEGER);
     CREATE TABLE posts(pid TEXT PRIMARY KEY, author_pid TEXT, created_at TEXT, text TEXT, lang TEXT,
         conversation_pid TEXT, reply_to_user_pid TEXT, ref_type TEXT, ref_post_pid TEXT,
         mention_pids TEXT, likes INTEGER, reposts INTEGER, replies INTEGER, quotes INTEGER,
-        is_seed INTEGER, seed_queries TEXT, in_sample INTEGER);
+        is_seed INTEGER, seed_queries TEXT, in_sample INTEGER, source TEXT);
     CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
     """)
     sample = {r[0] for r in con.execute("SELECT user_id FROM sample")}
@@ -492,31 +569,35 @@ def cmd_export(con, cfg):
         "SELECT p.author_id, COUNT(DISTINCT p.id) FROM posts p JOIN seed_hits s ON s.post_id=p.id GROUP BY 1"))
     tl = {r[0]: (r[1], r[2]) for r in con.execute("SELECT user_id, n, status FROM timeline_done")}
     strat = dict(con.execute("SELECT user_id, query_name FROM sample"))
-    amatch = {(u, q): n for u, q, n in con.execute("SELECT user_id, query_name, n FROM author_counts")}
+    probe = {r[0]: r[1:] for r in con.execute("SELECT user_id, baseline_total, baseline_daily, match_n FROM probe")}
+    p2 = {r[0]: r[1] for r in con.execute("SELECT user_id, n FROM phase2")}
 
     for u in con.execute("SELECT * FROM users").fetchall():
         (uid, _uname, name, desc, created, fol, fng, tc, listed, prot, ver, _vt, url, loc,
          _pin, img, _f) = u
         hits = [k for k in name_kw if k and k in (name or "")]
         tstat = tl.get(uid, (None, None))
-        out.execute("INSERT INTO accounts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+        pr = probe.get(uid, (None, None, None))
+        pc = phase1_class(cfg, created, desc, pr[0], pr[1]) if uid in probe else None
+        out.execute("INSERT INTO accounts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
             pid("u", uid), created, fol, fng, tc, listed, prot, ver,
             scrub_bio(desc), len(AT_RE.findall(desc or "")), int(bool(URL_RE.search(desc or ""))),
             int(bool(url)), int(bool(loc)), int("default_profile" in (img or "")),
             json.dumps(hits, ensure_ascii=False), json.dumps(sorted(acct_seed.get(uid, [])), ensure_ascii=False),
-            acct_seed_n.get(uid, 0), tstat[1], tstat[0], strat.get(uid), amatch.get((uid, strat.get(uid)))))
+            acct_seed_n.get(uid, 0), tstat[1], tstat[0], strat.get(uid), pr[2], pr[0], pr[1], pc,
+            int(uid in p2), p2.get(uid)))
 
     for row in con.execute("SELECT id, author_id, created_at, text, lang, conversation_id, "
-                           "in_reply_to_user_id, referenced, mentions, metrics FROM posts"):
-        (i, aid, created, text, lang, conv, rto, refs, ments, mets) = row
+                           "in_reply_to_user_id, referenced, mentions, metrics, source FROM posts"):
+        (i, aid, created, text, lang, conv, rto, refs, ments, mets, src_) = row
         refs, ments, mets = json.loads(refs or "[]"), json.loads(ments or "[]"), json.loads(mets or "{}")
         ref = refs[0] if refs else {}
-        out.execute("INSERT INTO posts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+        out.execute("INSERT INTO posts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
             pid("p", i), pid("u", aid), created, scrub_post(text, ments), lang,
             pid("p", conv), pid("u", rto), ref.get("type"), pid("p", ref.get("id")),
             json.dumps([pid("u", m["id"]) for m in ments if m.get("id")]),
             mets.get("like_count"), mets.get("retweet_count"), mets.get("reply_count"), mets.get("quote_count"),
-            int(i in seedq), json.dumps(sorted(seedq.get(i, [])), ensure_ascii=False), int(aid in sample)))
+            int(i in seedq), json.dumps(sorted(seedq.get(i, [])), ensure_ascii=False), int(aid in sample), src_))
 
     out.executemany("INSERT INTO daily_counts VALUES(?,?,?)",
                     con.execute("SELECT query_name, substr(start,1,10), n FROM daily_counts").fetchall())
@@ -525,8 +606,10 @@ def cmd_export(con, cfg):
         ("queries", json.dumps([{"name": q["name"], "query": q["query"]} for q in cfg["queries"]], ensure_ascii=False)),
         ("search_endpoint", cfg.get("search_endpoint", "recent")),
         ("start_time", cfg.get("start_time") or ""), ("end_time", cfg.get("end_time") or ""),
-        ("max_accounts", str(cfg.get("max_accounts"))), ("random_seed", str(cfg.get("random_seed", 42))),
-        ("timeline_posts_per_account", str(cfg.get("timeline_posts_per_account"))),
+        ("random_seed", str(cfg.get("random_seed", 42))),
+        ("design", json.dumps({k: cfg.get(k) for k in ("baseline_start", "baseline_end", "daily_words", "phase1_rule",
+                               "phase2_accounts", "phase2_posts_per_account")}, ensure_ascii=False)),
+        ("n_accounts", json.dumps({q["name"]: n_accounts(cfg, q) for q in cfg["queries"]})),
         ("n_seed_authors", str(con.execute(
             "SELECT COUNT(DISTINCT p.author_id) FROM posts p JOIN seed_hits s ON s.post_id=p.id").fetchone()[0])),
     ])
@@ -610,7 +693,7 @@ def cmd_status(con):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["check", "run", "count", "search", "users", "timelines", "weights",
+    ap.add_argument("command", choices=["check", "run", "count", "search", "users", "probe", "phase2", "timelines",
                                         "export", "sync", "purge", "status"])
     ap.add_argument("--yes", action="store_true")
     a = ap.parse_args()
@@ -625,8 +708,8 @@ def main():
     cl = Client(load_env(), con, cfg)
     try:
         {"check": cmd_check, "run": cmd_run, "count": cmd_count, "search": cmd_search,
-         "users": cmd_users, "timelines": cmd_timelines,
-         "weights": cmd_weights}.get(a.command, lambda c, f: None)(cl, cfg)
+         "users": cmd_users, "probe": cmd_probe,
+         "phase2": cmd_phase2, "timelines": cmd_timelines}.get(a.command, lambda c, f: None)(cl, cfg)
         if a.command == "sync":
             cmd_sync(cl, cfg, a.yes)
     except BudgetExceeded as e:

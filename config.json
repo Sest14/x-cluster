@@ -3,45 +3,82 @@
     {
       "name": "regista",
       "query": "レジスタ (漫画 OR ゲッサン OR 連載 OR 炎上 OR 女子高生 OR JK OR 規制 OR 薬屋) lang:ja -is:retweet",
-      "n_accounts": 35
+      "n_accounts": 150
     },
     {
       "name": "bl_zoning",
       "query": "(BL OR ＢＬ OR ボーイズラブ) (焼き払い OR 焼き討ち OR 有害図書 OR ゾーニング OR 規制) lang:ja -is:retweet",
-      "n_accounts": 35
+      "n_accounts": 150
     },
     {
       "name": "uma_mune",
       "query": "ウマ娘 (胸揺れ OR 乳揺れ OR 揺れオフ OR 揺れ機能) lang:ja -is:retweet",
-      "n_accounts": 35
+      "n_accounts": 150
     },
     {
       "name": "edamame",
       "query": "(\"湯あがり娘\" OR \"湯上がり娘\") lang:ja -is:retweet",
-      "n_accounts": 35
+      "n_accounts": 150
     },
     {
       "name": "saito",
       "query": "(斉藤慎二 OR 斎藤慎二 OR (ジャンポケ (斉藤 OR 斎藤))) lang:ja -is:retweet",
-      "n_accounts": 35
+      "n_accounts": 150
     },
     {
       "name": "touken",
       "query": "(刀剣乱舞 OR とうらぶ OR 刀剣男士 OR 審神者) (男性向け OR 男性向 OR 男オタ OR 男性オタク OR 男向け OR フェミ OR 表現規制 OR ゾーニング) lang:ja -is:retweet",
-      "n_accounts": 35
+      "n_accounts": 150
     },
     {
       "name": "control",
       "query": "の lang:ja -is:retweet",
-      "n_accounts": 70,
-      "max_seed_posts": 250
+      "n_accounts": 150
     }
   ],
   "search_endpoint": "all",
   "start_time": "2026-10-20T00:00:00Z",
   "end_time": null,
-  "max_seed_posts_per_query": 350,
+  "max_seed_posts_per_query": 280,
   "random_seed": 42,
+  "baseline_start": "2026-09-15T00:00:00Z",
+  "baseline_end": "2026-10-15T00:00:00Z",
+  "daily_words": [
+    "今日",
+    "仕事",
+    "ご飯",
+    "ごはん",
+    "眠い",
+    "寝る",
+    "起きた",
+    "疲れた",
+    "帰宅",
+    "出勤",
+    "雨",
+    "暑い",
+    "寒い",
+    "美味しい",
+    "買った",
+    "休み"
+  ],
+  "phase1_rule": {
+    "new_account_after": "2026-10-15T00:00:00Z",
+    "bio_patterns": [
+      "サブ",
+      "別垢",
+      "本垢",
+      "避難",
+      "議論用",
+      "愚痴",
+      "[^\\s]+用(垢|アカ|アカウント)",
+      "専用",
+      "用$"
+    ],
+    "min_baseline_posts": 5,
+    "daily_ratio_threshold": 0.15
+  },
+  "phase2_accounts": 160,
+  "phase2_posts_per_account": 30,
   "timeline_posts_per_account": 100,
   "timeline_exclude": [
     "retweets"
@@ -56,7 +93,7 @@
     "別垢",
     "避難"
   ],
-  "budget_usd": 165,
+  "budget_usd": 90,
   "prices": {
     "post": 0.005,
     "user": 0.01,
