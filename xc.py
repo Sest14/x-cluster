@@ -4,11 +4,12 @@
 Usage (Windows):  py xc.py <command> [--yes]
 Commands:
   check      Verify the token with one cheap count request (~$0.005)
-  run        Do everything below (count, search, users, timelines, export) in one go
+  run        Do everything below (count, search, users, timelines, weights, export) in one go
   count      Count matching posts per query (1 request per query, ~$0.005 each)
   search     Collect seed posts for each query in config.json
   users      Sample authors from seed posts and fetch their profiles
   timelines  Fetch recent posts of the sampled accounts
+  weights    Count each sampled account's matching posts (for sampling weights)
   export     Build analysis.sqlite (pseudonymized) for analysis
   sync       Re-check stored posts/users against X and delete removed ones (costs money; needs --yes)
   purge      Delete raw.sqlite and analysis.sqlite (needs --yes)
@@ -96,7 +97,16 @@ def raw_db():
         pinned_tweet_id TEXT, profile_image_url TEXT, fetched_at TEXT);
     CREATE TABLE IF NOT EXISTS timeline_done(user_id TEXT PRIMARY KEY, n INTEGER, status TEXT, fetched_at TEXT);
     CREATE TABLE IF NOT EXISTS ledger(ts TEXT, endpoint TEXT, kind TEXT, units INTEGER, usd REAL);
+    CREATE TABLE IF NOT EXISTS daily_counts(query_name TEXT, start TEXT, end TEXT, n INTEGER,
+        PRIMARY KEY(query_name, start));
+    CREATE TABLE IF NOT EXISTS search_day_state(query_name TEXT, start TEXT, quota INTEGER, n INTEGER,
+        next_token TEXT, done INTEGER, PRIMARY KEY(query_name, start));
+    CREATE TABLE IF NOT EXISTS author_counts(user_id TEXT, query_name TEXT, n INTEGER,
+        PRIMARY KEY(user_id, query_name));
     """)
+    cols = [r[1] for r in con.execute("PRAGMA table_info(sample)")]
+    if "query_name" not in cols:
+        con.execute("ALTER TABLE sample ADD COLUMN query_name TEXT")
     return con
 
 
@@ -190,19 +200,44 @@ def time_params(cfg):
 
 # ---------------------------------------------------------------- commands
 
-def cmd_run(cl, cfg):
-    """count -> estimate -> search -> users -> timelines -> export, in one go."""
-    if not cl.con.execute("SELECT 1 FROM search_state LIMIT 1").fetchone():
-        cmd_count(cl, cfg)
+def seed_cap(cfg, q):
+    return int(q.get("max_seed_posts", cfg.get("max_seed_posts_per_query", 500)))
+
+
+def n_accounts(cfg, q):
+    if "n_accounts" in q:
+        return int(q["n_accounts"])
+    k = int(cfg.get("max_accounts", 200))
+    return -(-k // max(1, len(cfg["queries"])))  # ceil
+
+
+def estimate(cl, cfg):
     p = cl.prices
-    est = (len(cfg["queries"]) * int(cfg.get("max_seed_posts_per_query", 500)) * p.get("post", 0)
-           + int(cfg.get("max_accounts", 200)) * (p.get("user", 0)
-           + int(cfg.get("timeline_posts_per_account", 100)) * p.get("post", 0)))
-    print(f"\n最大見積もり ${est:.2f}（予算上限 ${cl.budget:.2f}、ここまでの推定使用額 ${cl.spent():.2f}）")
+    per_acct = p.get("user", 0) + int(cfg.get("timeline_posts_per_account", 100)) * p.get("post", 0) \
+        + p.get("count_all_request", 0) * (cfg.get("search_endpoint") == "all")
+    total = 0.0
+    for q in cfg["queries"]:
+        buckets = cl.con.execute("SELECT start, end, n FROM daily_counts WHERE query_name=? ORDER BY start",
+                                 (q["name"],)).fetchall()
+        if buckets:  # each day's request returns at least 10 posts, so small quotas cost a bit extra
+            seeds = sum(max(x, 10) for x in allocate(seed_cap(cfg, q), buckets) if x > 0)
+        else:
+            seeds = seed_cap(cfg, q)
+        total += seeds * p.get("post", 0) + n_accounts(cfg, q) * per_acct
+    return total
+
+
+def cmd_run(cl, cfg):
+    """count -> estimate -> search -> users -> timelines -> weights -> export, in one go."""
+    have = {r[0] for r in cl.con.execute("SELECT DISTINCT query_name FROM daily_counts")}
+    if any(q["name"] not in have for q in cfg["queries"]):
+        cmd_count(cl, cfg)
+    print(f"\n最大見積もり ${estimate(cl, cfg):.2f}（予算上限 ${cl.budget:.2f}、ここまでの推定使用額 ${cl.spent():.2f}）")
     print("予算上限に達した時点で自動停止します。Ctrl+C で中断しても、再実行すれば続きから再開します。\n")
     cmd_search(cl, cfg)
     cmd_users(cl, cfg)
     cmd_timelines(cl, cfg)
+    cmd_weights(cl, cfg)
     cmd_export(cl.con, cfg)
     print("\n完了しました。Claude に「終わった」と伝えてください。")
 
@@ -214,82 +249,117 @@ def cmd_check(cl, cfg):
           f"{d.get('meta', {}).get('total_tweet_count', '?'):,}")
 
 
+def count_query(cl, cfg, query):
+    """Return list of (start, end, n) day buckets for a query over the configured period."""
+    ep = "all" if cfg.get("search_endpoint") == "all" else "recent"
+    params = {"query": query, "granularity": "day", **time_params(cfg)}
+    out, pages = [], 0
+    while True:
+        d = cl.get(f"/tweets/counts/{ep}", params, 0.02)
+        cl.charge(f"counts/{ep}", "count_request" if ep == "recent" else "count_all_request", 1)
+        out += [(b["start"], b["end"], int(b.get("tweet_count", 0))) for b in d.get("data", [])]
+        pages += 1
+        nt = d.get("meta", {}).get("next_token")
+        if not nt or pages >= 20:
+            break
+        params["next_token"] = nt
+        if ep == "all":
+            time.sleep(1.1)
+    return out
+
+
 def cmd_count(cl, cfg):
     ep = "all" if cfg.get("search_endpoint") == "all" else "recent"
     total = 0
     for q in cfg["queries"]:
-        params = {"query": q["query"], "granularity": "day", **time_params(cfg)}
-        n, pages = 0, 0
-        while True:
-            d = cl.get(f"/tweets/counts/{ep}", params, 0.02)
-            cl.charge(f"counts/{ep}", "count_request" if ep == "recent" else "count_all_request", 1)
-            n += d.get("meta", {}).get("total_tweet_count", 0)
-            pages += 1
-            nt = d.get("meta", {}).get("next_token")
-            if not nt or pages >= 20:
-                break
-            params["next_token"] = nt
+        buckets = count_query(cl, cfg, q["query"])
+        cl.con.execute("DELETE FROM daily_counts WHERE query_name=?", (q["name"],))
+        cl.con.executemany("INSERT OR REPLACE INTO daily_counts VALUES(?,?,?,?)",
+                           [(q["name"], s, e, n) for s, e, n in buckets])
+        cl.con.commit()
+        n = sum(b[2] for b in buckets)
         total += n
-        cap = cfg.get("max_seed_posts_per_query", 0)
-        print(f"[{q['name']}] 該当 {n:,} 件 → 収集予定 {min(n, cap):,} 件"
-              f"（約 ${min(n, cap) * cl.prices.get('post', 0):.2f}）")
-    print(f"合計 {total:,} 件（対象期間: {'全期間' if ep == 'all' else '直近7日'}"
+        cap = seed_cap(cfg, q)
+        peak = max(buckets, key=lambda b: b[2]) if buckets else None
+        print(f"[{q['name']}] 該当 {n:,} 件 → 収集予定 {min(n, cap):,} 件（約 ${min(n, cap) * cl.prices.get('post', 0):.2f}）"
+              + (f"  ピーク {peak[0][:10]}（{peak[2]:,} 件）" if peak else ""))
+    print(f"合計 {total:,} 件（対象期間: {'全期間検索' if ep == 'all' else '直近7日'}"
           f"{'・設定期間' if time_params(cfg) else ''}）")
 
 
+def allocate(cap, buckets):
+    """Largest-remainder allocation of cap across day buckets, proportional to their counts."""
+    total = sum(n for _, _, n in buckets)
+    if total <= cap:
+        return [n for _, _, n in buckets]
+    raw = [cap * n / total for _, _, n in buckets]
+    q = [int(x) for x in raw]
+    for i in sorted(range(len(raw)), key=lambda i: raw[i] - q[i], reverse=True)[:cap - sum(q)]:
+        q[i] += 1
+    return q
+
+
 def cmd_search(cl, cfg):
+    """Seed collection, stratified by day in proportion to daily counts (ADR-0009)."""
     con = cl.con
     ep = "all" if cfg.get("search_endpoint") == "all" else "recent"
-    cap = int(cfg.get("max_seed_posts_per_query", 500))
     price = cl.prices.get("post", 0)
     for q in cfg["queries"]:
-        row = con.execute("SELECT next_token,n,done FROM search_state WHERE query_name=?", (q["name"],)).fetchone()
-        token, n, done = (row if row else (None, 0, 0))
-        if done:
-            print(f"[{q['name']}] 収集済み（{n} 件）")
-            continue
-        while n < cap:
-            params = {"query": q["query"], "max_results": min(100, max(10, cap - n)),
-                      "tweet.fields": TWEET_FIELDS, **time_params(cfg)}
-            if token:
-                params["next_token"] = token
-            d = cl.get(f"/tweets/search/{ep}", params, 100 * price)
-            data = d.get("data", [])
-            cl.charge(f"search/{ep}", "post", len(data))
-            for t in data:
-                store_post(con, t, "seed")
-                con.execute("INSERT OR IGNORE INTO seed_hits VALUES(?,?)", (t["id"], q["name"]))
-            n += len(data)
-            token = d.get("meta", {}).get("next_token")
-            con.execute("INSERT OR REPLACE INTO search_state VALUES(?,?,?,?)",
-                        (q["name"], token, n, 0 if token and n < cap else 1))
-            con.commit()
-            print(f"[{q['name']}] {n:,} 件  推定使用額 ${cl.spent():.2f}")
-            if not token:
-                break
-            if ep == "all":
-                time.sleep(1.1)  # full-archive search: 1 request/sec
+        buckets = con.execute("SELECT start, end, n FROM daily_counts WHERE query_name=? ORDER BY start",
+                              (q["name"],)).fetchall()
+        if not buckets:
+            raise SystemExit(f"[{q['name']}] の日別件数がありません。先に py xc.py count を実行してください。")
+        for (s, e, n), quota in zip(buckets, allocate(seed_cap(cfg, q), buckets)):
+            con.execute("INSERT OR IGNORE INTO search_day_state VALUES(?,?,?,?,?,?)", (q["name"], s, quota, 0, None, 0))
+        con.commit()
+        todo = con.execute("SELECT start, quota, n, next_token FROM search_day_state "
+                           "WHERE query_name=? AND done=0 AND quota>0 ORDER BY start", (q["name"],)).fetchall()
+        ends = {s: e for s, e, _ in buckets}
+        for s, quota, got, token in todo:
+            while got < quota:
+                params = {"query": q["query"], "max_results": max(10, min(100, quota - got)),
+                          "tweet.fields": TWEET_FIELDS, "start_time": s, "end_time": ends[s]}
+                if token:
+                    params["next_token"] = token
+                d = cl.get(f"/tweets/search/{ep}", params, 100 * price)
+                data = d.get("data", [])
+                cl.charge(f"search/{ep}", "post", len(data))
+                for t in data[:quota - got]:
+                    store_post(con, t, "seed")
+                    con.execute("INSERT OR IGNORE INTO seed_hits VALUES(?,?)", (t["id"], q["name"]))
+                got += min(len(data), quota - got)
+                token = d.get("meta", {}).get("next_token")
+                done = int(got >= quota or not token)
+                con.execute("UPDATE search_day_state SET n=?, next_token=?, done=? WHERE query_name=? AND start=?",
+                            (got, token, done, q["name"], s))
+                con.commit()
+                if ep == "all":
+                    time.sleep(1.1)  # full-archive search: 1 request/sec
+                if done:
+                    break
+        n_all = con.execute("SELECT COALESCE(SUM(n),0) FROM search_day_state WHERE query_name=?", (q["name"],)).fetchone()[0]
+        print(f"[{q['name']}] {n_all:,} 件（日別に比例配分）  推定使用額 ${cl.spent():.2f}")
     print("検索完了。")
 
 
 def cmd_users(cl, cfg):
     con = cl.con
     if not con.execute("SELECT 1 FROM sample LIMIT 1").fetchone():
-        k = int(cfg.get("max_accounts", 200))
         rng = random.Random(int(cfg.get("random_seed", 42)))
-        names = [q["name"] for q in cfg["queries"]]
-        by_q = {n: [r[0] for r in con.execute(
-            "SELECT DISTINCT p.author_id FROM posts p JOIN seed_hits s ON s.post_id=p.id "
-            "WHERE s.query_name=? ORDER BY p.author_id", (n,))] for n in names}
-        chosen, per = [], -(-k // max(1, len(names)))  # ceil: equal share per query (stratified)
-        for n in names:
-            pool = [a for a in by_q[n] if a not in set(chosen)]
-            take = pool if len(pool) <= per else rng.sample(pool, per)
-            chosen += take
-            print(f"  [{n}] 投稿者 {len(by_q[n]):,} 人 → {len(take):,} 人を抽出")
-        con.executemany("INSERT OR IGNORE INTO sample VALUES(?,?)", [(a, now()) for a in chosen])
+        chosen = set()
+        for q in cfg["queries"]:
+            pool = [r[0] for r in con.execute(
+                "SELECT DISTINCT p.author_id FROM posts p JOIN seed_hits s ON s.post_id=p.id "
+                "WHERE s.query_name=? ORDER BY p.author_id", (q["name"],))]
+            free = [a for a in pool if a not in chosen]
+            k = n_accounts(cfg, q)
+            take = free if len(free) <= k else rng.sample(free, k)
+            chosen.update(take)
+            con.executemany("INSERT OR IGNORE INTO sample(user_id, selected_at, query_name) VALUES(?,?,?)",
+                            [(a, now(), q["name"]) for a in take])
+            print(f"  [{q['name']}] 投稿者 {len(pool):,} 人 → {len(take):,} 人を抽出")
         con.commit()
-        print(f"合計 {len(chosen):,} 人を無作為抽出しました（検索条件ごとに均等割り当て）。")
+        print(f"合計 {len(chosen):,} 人を無作為抽出しました（検索条件ごとの層化抽出）。")
     todo = [r[0] for r in con.execute(
         "SELECT user_id FROM sample WHERE user_id NOT IN (SELECT id FROM users)")]
     price = cl.prices.get("user", 0)
@@ -343,6 +413,23 @@ def cmd_timelines(cl, cfg):
     print("タイムライン取得完了。")
 
 
+def cmd_weights(cl, cfg):
+    """For each sampled account, count its matching posts in its stratum over the period.
+    Used for inverse-probability weighting: accounts with many matching posts were more likely sampled (ADR-0009)."""
+    con = cl.con
+    qmap = {q["name"]: q["query"] for q in cfg["queries"]}
+    todo = con.execute("""SELECT s.user_id, s.query_name FROM sample s
+        WHERE NOT EXISTS (SELECT 1 FROM author_counts a WHERE a.user_id=s.user_id AND a.query_name=s.query_name)""").fetchall()
+    for i, (uid, qn) in enumerate(todo, 1):
+        if qn not in qmap:
+            continue
+        n = sum(b[2] for b in count_query(cl, cfg, f"({qmap[qn]}) from:{uid}"))
+        con.execute("INSERT OR REPLACE INTO author_counts VALUES(?,?,?)", (uid, qn, n))
+        con.commit()
+        if i % 20 == 0 or i == len(todo):
+            print(f"重み用の件数 {i:,}/{len(todo):,}  推定使用額 ${cl.spent():.2f}")
+
+
 # ---------------------------------------------------------------- pseudonymized export
 
 def salt():
@@ -385,7 +472,8 @@ def cmd_export(con, cfg):
         tweet_count INTEGER, listed INTEGER, protected INTEGER, verified INTEGER,
         bio TEXT, bio_mention_count INTEGER, bio_has_url INTEGER, has_url INTEGER, has_location INTEGER,
         default_image INTEGER, name_keyword_hits TEXT, seed_queries TEXT, seed_post_count INTEGER,
-        timeline_status TEXT, timeline_n INTEGER);
+        timeline_status TEXT, timeline_n INTEGER, stratum TEXT, stratum_match_posts INTEGER);
+    CREATE TABLE daily_counts(query_name TEXT, day TEXT, n INTEGER);
     CREATE TABLE posts(pid TEXT PRIMARY KEY, author_pid TEXT, created_at TEXT, text TEXT, lang TEXT,
         conversation_pid TEXT, reply_to_user_pid TEXT, ref_type TEXT, ref_post_pid TEXT,
         mention_pids TEXT, likes INTEGER, reposts INTEGER, replies INTEGER, quotes INTEGER,
@@ -403,18 +491,20 @@ def cmd_export(con, cfg):
     acct_seed_n = dict(con.execute(
         "SELECT p.author_id, COUNT(DISTINCT p.id) FROM posts p JOIN seed_hits s ON s.post_id=p.id GROUP BY 1"))
     tl = {r[0]: (r[1], r[2]) for r in con.execute("SELECT user_id, n, status FROM timeline_done")}
+    strat = dict(con.execute("SELECT user_id, query_name FROM sample"))
+    amatch = {(u, q): n for u, q, n in con.execute("SELECT user_id, query_name, n FROM author_counts")}
 
     for u in con.execute("SELECT * FROM users").fetchall():
         (uid, _uname, name, desc, created, fol, fng, tc, listed, prot, ver, _vt, url, loc,
          _pin, img, _f) = u
         hits = [k for k in name_kw if k and k in (name or "")]
         tstat = tl.get(uid, (None, None))
-        out.execute("INSERT INTO accounts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+        out.execute("INSERT INTO accounts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
             pid("u", uid), created, fol, fng, tc, listed, prot, ver,
             scrub_bio(desc), len(AT_RE.findall(desc or "")), int(bool(URL_RE.search(desc or ""))),
             int(bool(url)), int(bool(loc)), int("default_profile" in (img or "")),
             json.dumps(hits, ensure_ascii=False), json.dumps(sorted(acct_seed.get(uid, [])), ensure_ascii=False),
-            acct_seed_n.get(uid, 0), tstat[1], tstat[0]))
+            acct_seed_n.get(uid, 0), tstat[1], tstat[0], strat.get(uid), amatch.get((uid, strat.get(uid)))))
 
     for row in con.execute("SELECT id, author_id, created_at, text, lang, conversation_id, "
                            "in_reply_to_user_id, referenced, mentions, metrics FROM posts"):
@@ -428,6 +518,8 @@ def cmd_export(con, cfg):
             mets.get("like_count"), mets.get("retweet_count"), mets.get("reply_count"), mets.get("quote_count"),
             int(i in seedq), json.dumps(sorted(seedq.get(i, [])), ensure_ascii=False), int(aid in sample)))
 
+    out.executemany("INSERT INTO daily_counts VALUES(?,?,?)",
+                    con.execute("SELECT query_name, substr(start,1,10), n FROM daily_counts").fetchall())
     out.executemany("INSERT INTO meta VALUES(?,?)", [
         ("exported_at", now()),
         ("queries", json.dumps([{"name": q["name"], "query": q["query"]} for q in cfg["queries"]], ensure_ascii=False)),
@@ -518,7 +610,7 @@ def cmd_status(con):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["check", "run", "count", "search", "users", "timelines",
+    ap.add_argument("command", choices=["check", "run", "count", "search", "users", "timelines", "weights",
                                         "export", "sync", "purge", "status"])
     ap.add_argument("--yes", action="store_true")
     a = ap.parse_args()
@@ -533,7 +625,8 @@ def main():
     cl = Client(load_env(), con, cfg)
     try:
         {"check": cmd_check, "run": cmd_run, "count": cmd_count, "search": cmd_search,
-         "users": cmd_users, "timelines": cmd_timelines}.get(a.command, lambda c, f: None)(cl, cfg)
+         "users": cmd_users, "timelines": cmd_timelines,
+         "weights": cmd_weights}.get(a.command, lambda c, f: None)(cl, cfg)
         if a.command == "sync":
             cmd_sync(cl, cfg, a.yes)
     except BudgetExceeded as e:

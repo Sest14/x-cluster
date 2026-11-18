@@ -22,7 +22,7 @@ X API（従量課金）で投稿を集めて、このフォルダ内の SQLite �
 ふだんは次の2つだけで足ります。
 ```
 py xc.py count       … 検索条件ごとの該当件数と費用の見積もり
-py xc.py run         … 収集一式（search → users → timelines → export）
+py xc.py run         … 収集一式（search → users → timelines → weights → export）
 ```
 
 個別に実行する場合はこちら。
@@ -32,6 +32,7 @@ py xc.py count       … 検索条件ごとの該当件数を確認（1条件あ
 py xc.py search      … 起点となる投稿を収集
 py xc.py users       … 投稿者を無作為抽出し、プロフィールを取得
 py xc.py timelines   … 抽出したアカウントの直近の投稿を取得
+py xc.py weights     … 抽出したアカウントの該当投稿数を数える（抽出確率の補正用）
 py xc.py export      … analysis.sqlite（仮名化済み）を作成
 py xc.py status      … 現在の件数と推定使用額
 ```
@@ -43,8 +44,8 @@ py xc.py status      … 現在の件数と推定使用額
 - `queries`：検索条件。`name` はラベル、`query` は X の検索演算子（`OR`、`-is:retweet`、`lang:ja` など）
 - `search_endpoint`：`recent`（直近7日）または `all`（全期間。使える場合のみ）
 - `start_time` / `end_time`：期間の指定（例 `"2026-11-01T00:00:00Z"`）。指定しないときは `null`
-- `max_seed_posts_per_query`：1つの条件あたりの収集上限
-- `max_accounts`：分析対象として無作為抽出するアカウント数（検索条件ごとに均等に割り当て）
+- `max_seed_posts_per_query`：1つの条件あたりの起点投稿の上限（日別件数に比例して割り振る。条件ごとに `max_seed_posts` で上書き可）
+- `n_accounts`（各条件）：その条件の投稿者から無作為抽出するアカウント数
 - `timeline_posts_per_account`：1アカウントあたりの取得件数
 - `budget_usd`：推定使用額の上限
 
