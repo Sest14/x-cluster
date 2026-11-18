@@ -106,6 +106,8 @@ def raw_db():
         match_n INTEGER, fetched_at TEXT);
     CREATE TABLE IF NOT EXISTS phase2(user_id TEXT PRIMARY KEY, pred_class TEXT, selected_at TEXT, status TEXT, n INTEGER);
     """)
+    if "any_n" not in [r[1] for r in con.execute("PRAGMA table_info(probe)")]:
+        con.execute("ALTER TABLE probe ADD COLUMN any_n INTEGER")
     cols = [r[1] for r in con.execute("PRAGMA table_info(sample)")]
     if "query_name" not in cols:
         con.execute("ALTER TABLE sample ADD COLUMN query_name TEXT")
@@ -227,6 +229,8 @@ def estimate(cl, cfg):
             seeds = seed_cap(cfg, q)
         total += seeds * p.get("post", 0) + n_accounts(cfg, q) * per_p1
     total += int(cfg.get("phase2_accounts", 160)) * int(cfg.get("phase2_posts_per_account", 30)) * p.get("post", 0)
+    total += sum(n_accounts(cfg, q) for q in cfg["queries"]
+                 if q["name"] in cfg.get("any_controversy_groups", [])) * p.get("count_all_request", 0)
     return total
 
 
@@ -433,7 +437,11 @@ def cmd_probe(cl, cfg):
         tot = 0 if new else sum(b[2] for b in count_query(cl, cfg, f"from:{uid} -is:retweet", bs, be))
         day = 0 if (new or tot == 0) else sum(b[2] for b in count_query(cl, cfg, f"from:{uid} {daily} -is:retweet", bs, be))
         m = sum(b[2] for b in count_query(cl, cfg, f"({qmap[qn]}) from:{uid}")) if qn in qmap else None
-        con.execute("INSERT OR REPLACE INTO probe VALUES(?,?,?,?,?)", (uid, tot, day, m, now()))
+        anyn = None
+        if qn in cfg.get("any_controversy_groups", []):  # H3: did this account mention any of the controversies?
+            anyn = sum(b[2] for b in count_query(cl, cfg, f"({cfg['any_controversy_query']}) from:{uid}"))
+        con.execute("INSERT OR REPLACE INTO probe(user_id, baseline_total, baseline_daily, match_n, fetched_at, any_n) "
+                    "VALUES(?,?,?,?,?,?)", (uid, tot, day, m, now(), anyn))
         con.commit()
         if i % 25 == 0 or i == len(todo):
             print(f"第1段階の計測 {i:,}/{len(todo):,}  推定使用額 ${cl.spent():.2f}")
@@ -549,7 +557,8 @@ def cmd_export(con, cfg):
         bio TEXT, bio_mention_count INTEGER, bio_has_url INTEGER, has_url INTEGER, has_location INTEGER,
         default_image INTEGER, name_keyword_hits TEXT, seed_queries TEXT, seed_post_count INTEGER,
         timeline_status TEXT, timeline_n INTEGER, stratum TEXT, stratum_match_posts INTEGER,
-        baseline_total INTEGER, baseline_daily INTEGER, pred_class TEXT, phase2 INTEGER, phase2_n INTEGER);
+        baseline_total INTEGER, baseline_daily INTEGER, pred_class TEXT, phase2 INTEGER, phase2_n INTEGER,
+        any_controversy_n INTEGER);
     CREATE TABLE daily_counts(query_name TEXT, day TEXT, n INTEGER);
     CREATE TABLE posts(pid TEXT PRIMARY KEY, author_pid TEXT, created_at TEXT, text TEXT, lang TEXT,
         conversation_pid TEXT, reply_to_user_pid TEXT, ref_type TEXT, ref_post_pid TEXT,
@@ -569,7 +578,7 @@ def cmd_export(con, cfg):
         "SELECT p.author_id, COUNT(DISTINCT p.id) FROM posts p JOIN seed_hits s ON s.post_id=p.id GROUP BY 1"))
     tl = {r[0]: (r[1], r[2]) for r in con.execute("SELECT user_id, n, status FROM timeline_done")}
     strat = dict(con.execute("SELECT user_id, query_name FROM sample"))
-    probe = {r[0]: r[1:] for r in con.execute("SELECT user_id, baseline_total, baseline_daily, match_n FROM probe")}
+    probe = {r[0]: r[1:] for r in con.execute("SELECT user_id, baseline_total, baseline_daily, match_n, any_n FROM probe")}
     p2 = {r[0]: r[1] for r in con.execute("SELECT user_id, n FROM phase2")}
 
     for u in con.execute("SELECT * FROM users").fetchall():
@@ -577,15 +586,15 @@ def cmd_export(con, cfg):
          _pin, img, _f) = u
         hits = [k for k in name_kw if k and k in (name or "")]
         tstat = tl.get(uid, (None, None))
-        pr = probe.get(uid, (None, None, None))
+        pr = probe.get(uid, (None, None, None, None))
         pc = phase1_class(cfg, created, desc, pr[0], pr[1]) if uid in probe else None
-        out.execute("INSERT INTO accounts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+        out.execute("INSERT INTO accounts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
             pid("u", uid), created, fol, fng, tc, listed, prot, ver,
             scrub_bio(desc), len(AT_RE.findall(desc or "")), int(bool(URL_RE.search(desc or ""))),
             int(bool(url)), int(bool(loc)), int("default_profile" in (img or "")),
             json.dumps(hits, ensure_ascii=False), json.dumps(sorted(acct_seed.get(uid, [])), ensure_ascii=False),
             acct_seed_n.get(uid, 0), tstat[1], tstat[0], strat.get(uid), pr[2], pr[0], pr[1], pc,
-            int(uid in p2), p2.get(uid)))
+            int(uid in p2), p2.get(uid), pr[3]))
 
     for row in con.execute("SELECT id, author_id, created_at, text, lang, conversation_id, "
                            "in_reply_to_user_id, referenced, mentions, metrics, source FROM posts"):
