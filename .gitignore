@@ -1,0 +1,14 @@
+# secrets
+.env
+*.secret
+
+# X data (never commit: privacy + X Developer Policy)
+*.sqlite
+*.sqlite-journal
+*.db
+data/
+
+# python
+__pycache__/
+*.pyc
+.venv/

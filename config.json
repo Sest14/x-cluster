@@ -1,0 +1,55 @@
+{
+  "queries": [
+    {
+      "name": "regista",
+      "query": "レジスタ (漫画 OR ゲッサン OR 連載 OR 炎上 OR 女子高生 OR JK OR 規制 OR 薬屋) lang:ja -is:retweet"
+    },
+    {
+      "name": "bl_zoning",
+      "query": "(BL OR ＢＬ OR ボーイズラブ) (焼き払い OR 焼き討ち OR 有害図書 OR ゾーニング OR 規制) lang:ja -is:retweet"
+    },
+    {
+      "name": "uma_mune",
+      "query": "ウマ娘 (胸揺れ OR 乳揺れ OR 揺れオフ OR 揺れ機能) lang:ja -is:retweet"
+    },
+    {
+      "name": "edamame",
+      "query": "(\"湯あがり娘\" OR \"湯上がり娘\") lang:ja -is:retweet"
+    },
+    {
+      "name": "saito",
+      "query": "(斉藤慎二 OR 斎藤慎二 OR (ジャンポケ (斉藤 OR 斎藤))) lang:ja -is:retweet"
+    },
+    {
+      "name": "touken",
+      "query": "(刀剣乱舞 OR とうらぶ OR 刀剣男士 OR 審神者) (男性向け OR 男性向 OR 男オタ OR 男性オタク OR 男向け OR フェミ OR 表現規制 OR ゾーニング) lang:ja -is:retweet"
+    }
+  ],
+  "search_endpoint": "all",
+  "start_time": "2026-10-20T00:00:00Z",
+  "end_time": null,
+  "max_seed_posts_per_query": 600,
+  "max_accounts": 210,
+  "random_seed": 42,
+  "timeline_posts_per_account": 100,
+  "timeline_exclude": [
+    "retweets"
+  ],
+  "name_keywords": [
+    "サブ",
+    "垢",
+    "用",
+    "鍵",
+    "趣味",
+    "本垢",
+    "別垢",
+    "避難"
+  ],
+  "budget_usd": 130,
+  "prices": {
+    "post": 0.005,
+    "user": 0.01,
+    "count_request": 0.005,
+    "count_all_request": 0.01
+  }
+}
