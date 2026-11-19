@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """x_cluster: collect X posts -> local SQLite, with a pseudonymized export for analysis.
 
-Data sources (ADR-0014):
-  - TwexAPI (third party, cheap): posts and profiles.
-  - Official X API (pay-per-use): only daily counts and a coverage audit of what TwexAPI returns.
+Data sources (ADR-0015):
+  - Official X API (pay-per-use): daily counts, seed posts (day-proportional sample), profile fallback.
+  - TwexAPI (third party, cheap): account-scoped searches only (from:account) - usual posts, weights, mentions.
+    Its keyword search returned only ~20% of posts, so it is not used for seeds.
 
-Usage (Windows):  py xc.py <command> [--yes]
+Usage (Windows):  py xc.py <command> [args] [--yes]
 Commands:
-  tcheck     Test the TwexAPI key and the time-window syntax (a few hundred credits)
-  tdiag      Diagnose TwexAPI coverage for one query/day: py xc.py tdiag regista 2026-11-05
+  tcheck     Test the TwexAPI key and the time-window syntax
+  tdiag      Coverage diagnostics: tdiag <query> <day> [10min] | tdiag from <n> | tdiag fromid
   check      Test the official X API token (~$0.005)
-  run        Do everything below in order (count, tsearch, sample, tbaseline, tany, weights, coverage, export)
-  count      Official API: daily post counts per query (reference for coverage, ~$0.01 per query)
-  tsearch    TwexAPI: collect seed posts (all of them, or a day-proportional sample, per query)
+  run        Do everything below in order (count, search, sample, users, tbaseline, tweights, tany, export)
+  count      Official API: daily post counts per query (~$0.01 per query)
+  search     Official API: seed posts, day-proportional sample per query
   sample     Randomly sample accounts from the seed authors of each query
-  tbaseline  TwexAPI: fetch each sampled account's posts from before the controversy (or recent posts if new)
-  tany       TwexAPI: for groups in any_controversy_groups, check whether each account mentioned any controversy
-  weights    Official API: count each sampled account's matching posts (sampling weights for sampled groups)
-  coverage   Official API: audit TwexAPI coverage with random official posts (~$0.5 per query)
+  users      Profiles and @handles of sampled accounts (TwexAPI if resolve_via=twex, else official $0.01 each)
+  tbaseline  TwexAPI: each sampled account's posts from before the controversy (or recent posts if new)
+  tweights   TwexAPI: each sampled account's matching posts in the study period (sampling weights)
+  tany       TwexAPI: did accounts in any_controversy_groups mention any controversy (H3)
   export     Build analysis.sqlite (pseudonymized) for analysis
   purge      Delete raw.sqlite and analysis.sqlite (needs --yes)
   status     Show what is stored and what has been spent
@@ -48,7 +49,9 @@ OUT_DB = os.path.join(BASE, "analysis.sqlite")
 SALT_FILE = os.path.join(BASE, "salt.secret")
 CONFIG = os.path.join(BASE, "config.json")
 
-TWEET_FIELDS = "created_at,lang,referenced_tweets,in_reply_to_user_id,author_id,entities"
+TWEET_FIELDS = "created_at,lang,referenced_tweets,in_reply_to_user_id,author_id,entities,public_metrics"
+USER_FIELDS = ("created_at,description,public_metrics,protected,verified,verified_type,"
+               "url,location,pinned_tweet_id,profile_image_url")
 MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])@([A-Za-z0-9_]{1,15})")
 URL_RE = re.compile(r"https?://\S+")
 AT_RE = re.compile(r"@[A-Za-z0-9_]{1,15}")
@@ -111,6 +114,8 @@ def raw_db():
     CREATE TABLE IF NOT EXISTS twex_ledger(ts TEXT, path TEXT, items INTEGER, credits INTEGER);
     CREATE TABLE IF NOT EXISTS daily_counts(query_name TEXT, start TEXT, end TEXT, n INTEGER,
         PRIMARY KEY(query_name, start));
+    CREATE TABLE IF NOT EXISTS osearch_state(query_name TEXT, start TEXT, quota INTEGER, n INTEGER,
+        next_token TEXT, done INTEGER, PRIMARY KEY(query_name, start));
     CREATE TABLE IF NOT EXISTS tsearch_state(query_name TEXT, start TEXT, quota INTEGER, n INTEGER,
         cursor TEXT, done INTEGER, PRIMARY KEY(query_name, start));
     CREATE TABLE IF NOT EXISTS baseline_state(user_id TEXT PRIMARY KEY, window TEXT, n INTEGER, has_more INTEGER,
@@ -397,6 +402,16 @@ def store_twex_user(con, u):
          u.get("location"), str(pinned[0]) if pinned else None, img, now()))
 
 
+def store_official_user(con, u):
+    pm = u.get("public_metrics") or {}
+    con.execute("""INSERT OR REPLACE INTO users VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (u["id"], u.get("username"), u.get("name"), u.get("description"), iso(u.get("created_at")),
+         pm.get("followers_count"), pm.get("following_count"), pm.get("tweet_count"),
+         pm.get("listed_count"), int(bool(u.get("protected"))), int(bool(u.get("verified"))),
+         u.get("verified_type"), u.get("url"), u.get("location"), u.get("pinned_tweet_id"),
+         u.get("profile_image_url"), now()))
+
+
 def store_twex_page(con, data, source, query_name=None):
     n = 0
     for t in data:
@@ -485,51 +500,49 @@ def cmd_count(env, con, cfg):
         con.commit()
         n = sum(b[2] for b in buckets)
         total += n
-        plan = n if q.get("collect", "all") == "all" else min(n, seed_cap(cfg, q))
-        print(f"[{q['name']}] 公式の件数 {n:,} 件 → TwexAPI で {plan:,} 件取得予定"
-              f"（{'全件' if q.get('collect', 'all') == 'all' else '日別比例の抽出'}）")
+        plan = min(n, seed_cap(cfg, q))
+        print(f"[{q['name']}] 公式の件数 {n:,} 件 → 公式APIで日別比例に {plan:,} 件を集める予定")
     print(f"合計 {total:,} 件。公式API 推定使用額 ${cl.spent():.2f}")
 
 
-def cmd_tsearch(env, con, cfg):
-    """Seed posts via TwexAPI, day by day. collect=all: every post; collect=sample: day-proportional quota."""
+def cmd_search(env, con, cfg):
+    """Seed posts via the official API, stratified by day in proportion to daily counts (ADR-0009, ADR-0015)."""
     if need_counts(con, cfg):
         cmd_count(env, con, cfg)
-    tw = Twex(env["TWEX_API_KEY"], con, cfg)
+    cl = Client(env["X_BEARER_TOKEN"], con, cfg)
+    price = cl.prices.get("post", 0)
     for q in cfg["queries"]:
         buckets = con.execute("SELECT start, end, n FROM daily_counts WHERE query_name=? ORDER BY start",
                               (q["name"],)).fetchall()
-        mode = q.get("collect", "all")
-        quotas = [n for _, _, n in buckets] if mode == "all" else allocate(seed_cap(cfg, q), buckets)
-        for (s, e, n), quota in zip(buckets, quotas):
-            con.execute("INSERT OR IGNORE INTO tsearch_state VALUES(?,?,?,?,?,?)", (q["name"], s, quota, 0, None, 0))
+        for (st, e, n), quota in zip(buckets, allocate(seed_cap(cfg, q), buckets)):
+            con.execute("INSERT OR IGNORE INTO osearch_state VALUES(?,?,?,?,?,?)", (q["name"], st, quota, 0, None, 0))
         con.commit()
-        ends = {s: e for s, e, _ in buckets}
-        todo = con.execute("SELECT start, quota, n, cursor FROM tsearch_state WHERE query_name=? AND done=0 "
+        ends = {st: e for st, e, _ in buckets}
+        todo = con.execute("SELECT start, quota, n, next_token FROM osearch_state WHERE query_name=? AND done=0 "
                            "AND quota>0 ORDER BY start", (q["name"],)).fetchall()
-        term0 = web_query(q["query"])
-        for s, quota, got, cursor in todo:
-            term = f"{term0} {window_ops(cfg, s, ends[s])}"
-            # collect=all keeps paging until TwexAPI runs out (it may return more or fewer than the official count)
-            limit = None if mode == "all" else quota
-            while True:
-                data, cursor = tw.search_page(term, cursor)
-                if limit is not None:
-                    data = data[:max(0, limit - got)]
-                got += store_twex_page(con, data, "seed", q["name"])
-                done = int(not cursor or not data or (limit is not None and got >= limit))
-                con.execute("UPDATE tsearch_state SET n=?, cursor=?, done=? WHERE query_name=? AND start=?",
-                            (got, cursor, done, q["name"], s))
+        for st, quota, got, token in todo:
+            while got < quota:
+                params = {"query": q["query"], "max_results": max(10, min(100, quota - got)),
+                          "tweet.fields": TWEET_FIELDS, "start_time": st, "end_time": ends[st]}
+                if token:
+                    params["next_token"] = token
+                d = cl.get("/tweets/search/all", params, 100 * price)
+                data = d.get("data", [])
+                cl.charge("search/all", "post", len(data))
+                for t in data[:quota - got]:
+                    store_post(con, t, "seed")
+                    con.execute("INSERT OR IGNORE INTO seed_hits VALUES(?,?)", (t["id"], q["name"]))
+                got += min(len(data), quota - got)
+                token = d.get("meta", {}).get("next_token")
+                done = int(got >= quota or not token)
+                con.execute("UPDATE osearch_state SET n=?, next_token=?, done=? WHERE query_name=? AND start=?",
+                            (got, token, done, q["name"], st))
                 con.commit()
-                if tw.n_req % 25 == 0:
-                    print(f"  [{q['name']}] {s[:10]} 取得中 {got:,} 件  {tw.pace()}")
+                time.sleep(1.1)  # full-archive search: 1 request/sec
                 if done:
                     break
-            print(f"  [{q['name']}] {s[:10]} 完了 {got:,} 件（公式 {quota:,} 件）  {tw.pace()}")
-        tot = con.execute("SELECT COALESCE(SUM(n),0), COALESCE(SUM(quota),0) FROM tsearch_state WHERE query_name=?",
-                          (q["name"],)).fetchone()
-        print(f"[{q['name']}] TwexAPI {tot[0]:,} 件（公式の件数{'（全件）' if mode == 'all' else 'に比例した目標'} {tot[1]:,} 件）"
-              f"  クレジット使用 {tw.used():,}")
+        n_all = con.execute("SELECT COALESCE(SUM(n),0) FROM osearch_state WHERE query_name=?", (q["name"],)).fetchone()[0]
+        print(f"[{q['name']}] 起点の投稿 {n_all:,} 件（日別に比例配分）  公式API 推定使用額 ${cl.spent():.2f}")
     print("検索完了。")
 
 
@@ -553,6 +566,42 @@ def cmd_sample(env, con, cfg):
         print(f"  [{q['name']}] 投稿者 {len(pool):,} 人 → {len(take):,} 人を無作為抽出")
     con.commit()
     print(f"合計 {len(chosen):,} 人。")
+
+
+def cmd_users(env, con, cfg):
+    """Profiles (incl. @handle) of sampled accounts. resolve_via=twex: TwexAPI 'from:<id>' search (cheap);
+    otherwise, or for accounts TwexAPI could not resolve, the official users lookup ($0.01 each)."""
+    todo = [r[0] for r in con.execute(
+        "SELECT user_id FROM sample WHERE user_id NOT IN (SELECT id FROM users WHERE username IS NOT NULL)")]
+    if cfg.get("resolve_via") == "twex" and todo:
+        tw = Twex(env["TWEX_API_KEY"], con, cfg)
+        w = window_ops(cfg, cfg["start_time"], cfg.get("end_time") or now())
+        for i, uid in enumerate(todo, 1):
+            data, _ = tw.search_page(f"from:{uid} -filter:retweets {w}")
+            for t in data:
+                u = t.get("user") or t.get("author") or {}
+                if str(u.get("id")) == uid:
+                    store_twex_user(con, u)
+                    break
+            con.commit()
+            if i % 50 == 0 or i == len(todo):
+                print(f"プロフィール（TwexAPI） {i:,}/{len(todo):,}  {tw.pace()}")
+        todo = [r[0] for r in con.execute(
+            "SELECT user_id FROM sample WHERE user_id NOT IN (SELECT id FROM users WHERE username IS NOT NULL)")]
+    if not todo:
+        print("プロフィール取得完了。")
+        return
+    cl = Client(env["X_BEARER_TOKEN"], con, cfg)
+    for i in range(0, len(todo), 100):
+        batch = todo[i:i + 100]
+        d = cl.get("/users", {"ids": ",".join(batch), "user.fields": USER_FIELDS}, len(batch) * cl.prices.get("user", 0))
+        data = d.get("data", [])
+        cl.charge("users", "user", len(data))
+        for u in data:
+            store_official_user(con, u)
+        con.commit()
+        print(f"プロフィール（公式API） {min(i + 100, len(todo)):,}/{len(todo):,}  公式API 推定使用額 ${cl.spent():.2f}")
+    print("プロフィール取得完了。")
 
 
 def cmd_tbaseline(env, con, cfg):
@@ -608,58 +657,30 @@ def cmd_tany(env, con, cfg):
             print(f"言及の確認 {i:,}/{len(todo):,}  {tw.pace()}")
 
 
-def cmd_weights(env, con, cfg):
-    """Official counts of each sampled account's matching posts, for groups sampled from a day-proportional
-    subset (ADR-0009). Groups collected in full need no weights: their authors are a simple random sample."""
-    groups = [q for q in cfg["queries"] if q.get("collect", "all") != "all"]
-    if not groups:
-        return
-    cl = Client(env["X_BEARER_TOKEN"], con, cfg)
-    for q in groups:
-        todo = con.execute("""SELECT s.user_id FROM sample s WHERE s.query_name=?
-            AND s.user_id NOT IN (SELECT user_id FROM probe WHERE match_n IS NOT NULL)""", (q["name"],)).fetchall()
-        for i, (uid,) in enumerate(todo, 1):
-            n = sum(b[2] for b in count_query(cl, cfg, f"({q['query']}) from:{uid}", cfg["start_time"], cfg.get("end_time")))
-            con.execute("INSERT INTO probe(user_id, match_n, fetched_at) VALUES(?,?,?) "
-                        "ON CONFLICT(user_id) DO UPDATE SET match_n=excluded.match_n", (uid, n, now()))
-            con.commit()
-            if i % 50 == 0 or i == len(todo):
-                print(f"  [{q['name']}] 重み用の件数 {i:,}/{len(todo):,}  公式API 推定使用額 ${cl.spent():.2f}")
-
-
-def cmd_coverage(env, con, cfg):
-    """Audit TwexAPI coverage: take official posts from random one-hour windows (weighted by daily counts)
-    and check whether TwexAPI returned them. Only for collect=all queries."""
-    cl = Client(env["X_BEARER_TOKEN"], con, cfg)
-    rng = random.Random(int(cfg.get("random_seed", 42)) + 7)
-    k, per = int(cfg.get("coverage_windows_per_query", 10)), int(cfg.get("coverage_posts_per_window", 10))
-    have = {r[0] for r in con.execute("SELECT post_id FROM seed_hits")}
-    for q in [q for q in cfg["queries"] if q.get("collect", "all") == "all"]:
-        if con.execute("SELECT 1 FROM audit WHERE query_name=? LIMIT 1", (q["name"],)).fetchone():
+def cmd_tweights(env, con, cfg):
+    """Sampling weights (ADR-0009): each sampled account's posts matching its group's query in the study period,
+    counted with TwexAPI 'from:' searches (account-scoped searches are near-complete, ADR-0015). Capped."""
+    tw = Twex(env["TWEX_API_KEY"], con, cfg)
+    cap = int(cfg.get("weight_count_cap", 200))
+    qmap = {q["name"]: web_query(q["query"]) for q in cfg["queries"]}
+    w = window_ops(cfg, cfg["start_time"], cfg.get("end_time") or now())
+    todo = con.execute("""SELECT s.user_id, s.query_name, u.username FROM sample s JOIN users u ON u.id=s.user_id
+        WHERE s.user_id NOT IN (SELECT user_id FROM probe WHERE match_n IS NOT NULL)""").fetchall()
+    for i, (uid, qn, sn) in enumerate(todo, 1):
+        if not sn or qn not in qmap:
             continue
-        buckets = con.execute("SELECT start, n FROM daily_counts WHERE query_name=? AND n>0", (q["name"],)).fetchall()
-        if not buckets:
-            continue
-        days = rng.choices([b[0] for b in buckets], weights=[b[1] for b in buckets], k=k)
-        for day in days:
-            s = to_dt(day) + dt.timedelta(hours=rng.randrange(24))
-            params = {"query": q["query"], "max_results": max(10, per), "tweet.fields": TWEET_FIELDS,
-                      "start_time": iso(s.isoformat()), "end_time": iso((s + dt.timedelta(hours=1)).isoformat())}
-            d = cl.get("/tweets/search/all", params, max(10, per) * cl.prices.get("post", 0))
-            data = d.get("data", [])
-            cl.charge("search/all(audit)", "post", len(data))
-            for t in data[:per]:
-                refs = t.get("referenced_tweets") or []
-                con.execute("INSERT OR IGNORE INTO audit VALUES(?,?,?,?,?,?,?,?,?)", (
-                    t["id"], q["name"], iso(s.isoformat()), int(t["id"] in have),
-                    int(any(r.get("type") == "replied_to" for r in refs)),
-                    int(any(r.get("type") == "quoted" for r in refs)),
-                    len((t.get("entities") or {}).get("mentions", [])), t.get("text"), t.get("author_id")))
-            con.commit()
-            time.sleep(1.1)
-        r = con.execute("SELECT COUNT(*), SUM(in_twex) FROM audit WHERE query_name=?", (q["name"],)).fetchone()
-        print(f"[{q['name']}] 公式の投稿 {r[0]} 件のうち TwexAPI で取れていたのは {r[1] or 0} 件"
-              f"（{(r[1] or 0) / max(1, r[0]):.0%}）  公式API 推定使用額 ${cl.spent():.2f}")
+        n, cursor, more = 0, None, 0
+        while n < cap:
+            data, cursor = tw.search_page(f"from:{sn} ({qmap[qn]}) {w}", cursor)
+            n += len(data)
+            if not cursor or not data:
+                break
+        more = int(bool(cursor) and n >= cap)
+        con.execute("INSERT INTO probe(user_id, match_n, any_more, fetched_at) VALUES(?,?,NULL,?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET match_n=excluded.match_n", (uid, min(n, cap), now()))
+        con.commit()
+        if i % 50 == 0 or i == len(todo):
+            print(f"重み用の件数 {i:,}/{len(todo):,}  {tw.pace()}")
 
 
 def cmd_tdiag(env, con, cfg, args=()):
@@ -667,6 +688,8 @@ def cmd_tdiag(env, con, cfg, args=()):
     (A) one 6-hour window and (B) six 1-hour windows. Usage: py xc.py tdiag regista 2026-11-05"""
     if args and args[0] == "from":
         return tdiag_from(env, con, cfg, int(args[1]) if len(args) > 1 else 10)
+    if args and args[0] == "fromid":
+        return tdiag_fromid(env, con, cfg)
     qname = args[0] if args else cfg["queries"][0]["name"]
     day = args[1] if len(args) > 1 else None
     if len(args) > 2 and args[2] == "10min":
@@ -746,6 +769,23 @@ def tdiag_10min(env, con, cfg, qname, day):
     con.commit()
 
 
+def tdiag_fromid(env, con, cfg):
+    """Does TwexAPI accept 'from:<numeric user id>'? If yes, set resolve_via=twex to skip the official users lookup."""
+    tw = Twex(env["TWEX_API_KEY"], con, cfg)
+    rows = con.execute("SELECT DISTINCT u.id, u.username FROM users u JOIN posts p ON p.author_id=u.id "
+                       "WHERE u.username IS NOT NULL LIMIT 3").fetchall()
+    w = window_ops(cfg, cfg["start_time"], now())
+    ok = 0
+    for i, (uid, sn) in enumerate(rows, 1):
+        data, _ = tw.search_page(f"from:{uid} -filter:retweets {w}")
+        hit = any(str((t.get("user") or {}).get("id")) == str(uid) for t in data)
+        ok += hit
+        print(f"  アカウント{i}: from:<ID> で {len(data)} 件、本人の投稿 {'あり' if hit else 'なし'}")
+    print("from:<ID> は使えます。config.json の resolve_via を \"twex\" にしてください。" if ok == len(rows) and rows
+          else "from:<ID> は使えません。resolve_via は \"official\" のまま（公式APIで1人0.01ドル）にします。")
+    con.commit()
+
+
 def tdiag_from(env, con, cfg, n):
     """Coverage of 'from:account' searches in the baseline window, for n random seed authors."""
     cl = Client(env["X_BEARER_TOKEN"], con, cfg)
@@ -776,12 +816,12 @@ def cmd_run(env, con, cfg):
     print("収集を始めます。Ctrl+C で中断しても、同じコマンドで続きから再開します。PCはつけたままにしてください。\n")
     if need_counts(con, cfg):
         cmd_count(env, con, cfg)
-    cmd_tsearch(env, con, cfg)
+    cmd_search(env, con, cfg)
     cmd_sample(env, con, cfg)
+    cmd_users(env, con, cfg)
     cmd_tbaseline(env, con, cfg)
+    cmd_tweights(env, con, cfg)
     cmd_tany(env, con, cfg)
-    cmd_weights(env, con, cfg)
-    cmd_coverage(env, con, cfg)
     cmd_export(env, con, cfg)
     print("\n完了しました。Claude に「終わった」と伝えてください。")
 
@@ -857,7 +897,7 @@ def cmd_export(env, con, cfg):
         reply_to_user_pid TEXT, ref_type TEXT, ref_post_pid TEXT, mention_pids TEXT,
         likes INTEGER, reposts INTEGER, replies INTEGER, quotes INTEGER,
         is_seed INTEGER, seed_queries TEXT, in_sample INTEGER, source TEXT);
-    CREATE TABLE daily_counts(query_name TEXT, day TEXT, official_n INTEGER, twex_n INTEGER);
+    CREATE TABLE daily_counts(query_name TEXT, day TEXT, official_n INTEGER, seeds_n INTEGER);
     CREATE TABLE audit(post_pid TEXT, query_name TEXT, window_start TEXT, in_twex INTEGER,
         is_reply INTEGER, is_quote INTEGER, n_mentions INTEGER, text TEXT);
     CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
@@ -931,7 +971,7 @@ def cmd_export(env, con, cfg):
             mets.get("like_count"), mets.get("retweet_count"), mets.get("reply_count"), mets.get("quote_count"),
             int(i in seedq), json.dumps(sorted(seedq.get(i, [])), ensure_ascii=False), int(aid in sample), src_))
 
-    twex_daily = {(qn, st[:10]): n for qn, st, n in con.execute("SELECT query_name, start, n FROM tsearch_state")}
+    twex_daily = {(qn, st[:10]): n for qn, st, n in con.execute("SELECT query_name, start, n FROM osearch_state")}
     out.executemany("INSERT INTO daily_counts VALUES(?,?,?,?)",
                     [(qn, st[:10], n, twex_daily.get((qn, st[:10])))
                      for qn, st, n in con.execute("SELECT query_name, start, n FROM daily_counts")])
@@ -976,15 +1016,17 @@ def cmd_status(env, con, cfg):
     q = lambda s: con.execute(s).fetchone()[0]
     print(f"起点の投稿:           {q('SELECT COUNT(DISTINCT post_id) FROM seed_hits'):,}")
     print(f"抽出したアカウント:   {q('SELECT COUNT(*) FROM sample'):,}")
+    print(f"プロフィール取得済:   {q('SELECT COUNT(*) FROM sample s JOIN users u ON u.id=s.user_id WHERE u.username IS NOT NULL'):,}")
     print(f"ふだんの投稿を取得済: {q('SELECT COUNT(*) FROM baseline_state'):,}")
+    print(f"重み用の件数を取得済: {q('SELECT COUNT(*) FROM probe WHERE match_n IS NOT NULL'):,}")
     print(f"保存中の投稿（合計）: {q('SELECT COUNT(*) FROM posts'):,}")
     print(f"TwexAPI クレジット:   {q('SELECT COALESCE(SUM(credits),0) FROM twex_ledger'):,}")
     print(f"公式API 推定使用額:   ${q('SELECT COALESCE(SUM(usd),0) FROM ledger'):.2f}")
 
 
-COMMANDS = {"tcheck": cmd_tcheck, "tdiag": cmd_tdiag, "check": cmd_check, "run": cmd_run, "count": cmd_count, "tsearch": cmd_tsearch,
-            "sample": cmd_sample, "tbaseline": cmd_tbaseline, "tany": cmd_tany, "weights": cmd_weights,
-            "coverage": cmd_coverage, "export": cmd_export, "status": cmd_status}
+COMMANDS = {"tcheck": cmd_tcheck, "tdiag": cmd_tdiag, "check": cmd_check, "run": cmd_run, "count": cmd_count,
+            "search": cmd_search, "sample": cmd_sample, "users": cmd_users, "tbaseline": cmd_tbaseline,
+            "tweights": cmd_tweights, "tany": cmd_tany, "export": cmd_export, "status": cmd_status}
 
 
 def main():

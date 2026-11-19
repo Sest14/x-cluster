@@ -4,51 +4,49 @@
       "name": "regista",
       "query": "レジスタ (漫画 OR ゲッサン OR 連載 OR 炎上 OR 女子高生 OR JK OR 規制 OR 薬屋) lang:ja -is:retweet",
       "n_accounts": 200,
-      "collect": "all"
+      "max_seed_posts": 300
     },
     {
       "name": "bl_zoning",
       "query": "(BL OR ＢＬ OR ボーイズラブ) (焼き払い OR 焼き討ち OR 有害図書 OR ゾーニング OR 規制) lang:ja -is:retweet",
       "n_accounts": 200,
-      "collect": "all"
+      "max_seed_posts": 300
     },
     {
       "name": "uma_mune",
       "query": "ウマ娘 (胸揺れ OR 乳揺れ OR 揺れオフ OR 揺れ機能) lang:ja -is:retweet",
       "n_accounts": 200,
-      "collect": "all"
+      "max_seed_posts": 300
     },
     {
       "name": "edamame",
       "query": "(\"湯あがり娘\" OR \"湯上がり娘\") lang:ja -is:retweet",
       "n_accounts": 200,
-      "collect": "all"
+      "max_seed_posts": 300
     },
     {
       "name": "saito",
       "query": "(斉藤慎二 OR 斎藤慎二 OR (ジャンポケ (斉藤 OR 斎藤))) lang:ja -is:retweet",
       "n_accounts": 200,
-      "collect": "all"
+      "max_seed_posts": 300
     },
     {
       "name": "touken",
       "query": "(刀剣乱舞 OR とうらぶ OR 刀剣男士 OR 審神者) (男性向け OR 男性向 OR 男オタ OR 男性オタク OR 男向け OR フェミ OR 表現規制 OR ゾーニング) lang:ja -is:retweet",
       "n_accounts": 200,
-      "collect": "all"
+      "max_seed_posts": 300
     },
     {
       "name": "touken_fans",
       "query": "(刀剣乱舞 OR とうらぶ OR 刀剣男士 OR 審神者) lang:ja -is:retweet",
       "n_accounts": 200,
-      "collect": "sample",
-      "max_seed_posts": 1000
+      "max_seed_posts": 300
     },
     {
       "name": "control",
       "query": "の lang:ja -is:retweet",
       "n_accounts": 200,
-      "collect": "sample",
-      "max_seed_posts": 1000
+      "max_seed_posts": 300
     }
   ],
   "start_time": "2026-10-20T00:00:00Z",
@@ -110,14 +108,14 @@
   ],
   "twex_qps": 1,
   "twex_time_format": "unix",
-  "twex_max_credits": 1000000,
-  "coverage_windows_per_query": 10,
-  "coverage_posts_per_window": 10,
-  "budget_usd": 15,
+  "twex_max_credits": 780000,
+  "budget_usd": 40,
   "prices": {
     "post": 0.005,
     "user": 0.01,
     "count_request": 0.005,
     "count_all_request": 0.01
-  }
+  },
+  "resolve_via": "official",
+  "weight_count_cap": 200
 }

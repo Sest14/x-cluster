@@ -10,7 +10,7 @@ X 上の言説と、その発言をしているアカウントを、集団レベ
 
 ## 収集スクリプト（xc.py）
 
-投稿とプロフィールを TwexAPI で集め、公式 X API で網羅性を検査して、このフォルダ内の SQLite に保存します。分析用に仮名化したファイル（analysis.sqlite）を書き出すところまでを担当します（ADR-0014）。
+起点の投稿を公式 X API で集め、抽出したアカウントのふだんの投稿などを TwexAPI のアカウント指定の検索（from:）で集めて、このフォルダ内の SQLite に保存します。分析用に仮名化したファイル（analysis.sqlite）を書き出すところまでを担当します（ADR-0015）。
 
 ## 必要なもの
 - Python 3.9 以上（標準ライブラリのみで動くので、追加インストールは不要）
@@ -21,22 +21,23 @@ X 上の言説と、その発言をしているアカウントを、集団レベ
   ```
 
 ## 実行順
-コマンドプロンプトでこのフォルダに移動してから実行します。ふだんは次の2つだけで足ります。
+コマンドプロンプトでこのフォルダに移動してから実行します。ふだんは `run` だけで足ります。
 ```
-py xc.py tcheck      … TwexAPI のキーと時間指定の書き方を確認（数百クレジット）
-py xc.py run         … 収集一式（count → tsearch → sample → tbaseline → tany → weights → coverage → export）
+py xc.py run         … 収集一式（count → search → sample → users → tbaseline → tweights → tany → export）
 ```
 
 個別に実行する場合はこちら。
 ```
 py xc.py check       … 公式APIのトークン確認（約$0.005）
-py xc.py count       … 公式API：検索条件ごとの日別件数（網羅性の基準）
-py xc.py tsearch     … TwexAPI：起点の投稿を集める（6件は全件、touken_fans と対照群は日別比例の抽出）
+py xc.py tcheck      … TwexAPI のキーと時間指定の確認
+py xc.py tdiag ...   … TwexAPI の網羅性の診断（tdiag from 10 / tdiag fromid / tdiag regista 2026-11-05 [10min]）
+py xc.py count       … 公式API：検索条件ごとの日別件数
+py xc.py search      … 公式API：起点の投稿を日別比例で集める
 py xc.py sample      … 起点の投稿者から各群のアカウントを無作為抽出
-py xc.py tbaseline   … TwexAPI：抽出したアカウントの炎上前の投稿（なければ直近の投稿）
+py xc.py users       … 抽出したアカウントのプロフィールと@名（resolve_via に応じて TwexAPI か公式API）
+py xc.py tbaseline   … TwexAPI：炎上前の投稿（なければ直近の投稿）
+py xc.py tweights    … TwexAPI：調査期間中の該当投稿数（抽出確率の重み）
 py xc.py tany        … TwexAPI：touken_fans と対照群が炎上に言及したか（H3）
-py xc.py weights     … 公式API：touken_fans と対照群の重み用の件数
-py xc.py coverage    … 公式API：TwexAPI の網羅性の抜き取り照合
 py xc.py export      … analysis.sqlite（仮名化済み）を作成
 py xc.py status      … 現在の件数、使用クレジット、公式APIの推定使用額
 ```
@@ -45,7 +46,7 @@ py xc.py status      … 現在の件数、使用クレジット、公式APIの�
 TwexAPI の使用クレジットが `twex_max_credits`、公式APIの推定使用額が `budget_usd` を超えそうになると自動で止まります。
 
 ## 設定（config.json）
-- `queries`：検索条件。`name` はラベル、`query` は公式APIの検索演算子で書く（TwexAPI 用には自動で書き換える）。`collect` は `all`（全件）か `sample`（日別比例で `max_seed_posts` 件）。`n_accounts` は抽出する人数
+- `queries`：検索条件。`name` はラベル、`query` は公式APIの検索演算子で書く（TwexAPI 用には自動で書き換える）。`max_seed_posts` は起点の投稿の数（日別比例）、`n_accounts` は抽出する人数
 - `start_time` / `end_time`：調査期間（`end_time` が `null` なら収集時点まで）
 - `baseline_start` / `baseline_end`：「ふだん」を測る炎上前の期間。`baseline_max_posts` は1人あたりの取得上限、`recent_max_posts` は炎上前の投稿がない人の取得上限
 - `daily_words`：日常の話を見分けるための語
@@ -55,7 +56,8 @@ TwexAPI の使用クレジットが `twex_max_credits`、公式APIの推定使�
 - `twex_qps`：TwexAPI への1秒あたりのリクエスト数（プランに合わせる。無料枠は0.2、Mini は1）
 - `twex_time_format`：時間の範囲の書き方（`unix` か `date_utc`。`tcheck` の結果で選ぶ）
 - `twex_max_credits`：TwexAPI のクレジット使用の上限
-- `coverage_windows_per_query` / `coverage_posts_per_window`：網羅性の照合の規模
+- `resolve_via`：プロフィールの取り方（`official` か `twex`。`tdiag fromid` の結果で選ぶ）
+- `weight_count_cap`：重み用に数える投稿数の上限
 - `budget_usd`：公式APIの推定使用額の上限
 
 ## ファイル
