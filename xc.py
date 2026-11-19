@@ -8,6 +8,7 @@ Data sources (ADR-0014):
 Usage (Windows):  py xc.py <command> [--yes]
 Commands:
   tcheck     Test the TwexAPI key and the time-window syntax (a few hundred credits)
+  tdiag      Diagnose TwexAPI coverage for one query/day: py xc.py tdiag regista 2026-11-05
   check      Test the official X API token (~$0.005)
   run        Do everything below in order (count, tsearch, sample, tbaseline, tany, weights, coverage, export)
   count      Official API: daily post counts per query (reference for coverage, ~$0.01 per query)
@@ -661,6 +662,53 @@ def cmd_coverage(env, con, cfg):
               f"（{(r[1] or 0) / max(1, r[0]):.0%}）  公式API 推定使用額 ${cl.spent():.2f}")
 
 
+def cmd_tdiag(env, con, cfg, args=()):
+    """Coverage diagnosis for one query and day: official hourly counts vs TwexAPI with
+    (A) one 6-hour window and (B) six 1-hour windows. Usage: py xc.py tdiag regista 2026-11-05"""
+    qname = args[0] if args else cfg["queries"][0]["name"]
+    day = args[1] if len(args) > 1 else None
+    q = next(x for x in cfg["queries"] if x["name"] == qname)
+    if not day:
+        day = con.execute("SELECT start FROM daily_counts WHERE query_name=? ORDER BY n DESC LIMIT 1",
+                          (qname,)).fetchone()[0][:10]
+    start = dt.datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
+    cl = Client(env["X_BEARER_TOKEN"], con, cfg)
+    d = cl.get("/tweets/counts/all", {"query": q["query"], "granularity": "hour",
+                                      "start_time": iso(start.isoformat()),
+                                      "end_time": iso((start + dt.timedelta(hours=6)).isoformat())}, 0.02)
+    cl.charge("counts/all(diag)", "count_all_request", 1)
+    hourly = [int(b.get("tweet_count", 0)) for b in d.get("data", [])]
+    print(f"[{qname}] {day} 0〜6時（UTC）の公式の件数: {sum(hourly):,}（1時間ごと {hourly}）")
+    tw = Twex(env["TWEX_API_KEY"], con, cfg)
+    term0 = web_query(q["query"])
+
+    def pull(s, e):
+        ids, cursor, pages, why = set(), None, 0, ""
+        while True:
+            data, cursor = tw.search_page(f"{term0} {window_ops(cfg, s.isoformat(), e.isoformat())}", cursor)
+            pages += 1
+            ids |= {str(t.get("id") or t.get("tweet_id")) for t in data}
+            if not data:
+                why = "空のページで終了"
+                break
+            if not cursor:
+                why = "次のページなしで終了"
+                break
+        return ids, pages, why
+
+    a, pages, why = pull(start, start + dt.timedelta(hours=6))
+    print(f"(A) 6時間の枠1つ: {len(a):,} 件（{pages} ページ、{why}）  {tw.pace()}")
+    b = set()
+    for h in range(6):
+        s = start + dt.timedelta(hours=h)
+        ids, pages, why = pull(s, s + dt.timedelta(hours=1))
+        b |= ids
+        print(f"    {h}時台: {len(ids):,} 件（公式 {hourly[h] if h < len(hourly) else '?'}、{pages} ページ、{why}）")
+    print(f"(B) 1時間の枠6つ: {len(b):,} 件  {tw.pace()}")
+    print(f"取れた割合: (A) {len(a) / max(1, sum(hourly)):.0%}  (B) {len(b) / max(1, sum(hourly)):.0%}")
+    con.commit()
+
+
 def cmd_run(env, con, cfg):
     print("収集を始めます。Ctrl+C で中断しても、同じコマンドで続きから再開します。PCはつけたままにしてください。\n")
     if need_counts(con, cfg):
@@ -871,7 +919,7 @@ def cmd_status(env, con, cfg):
     print(f"公式API 推定使用額:   ${q('SELECT COALESCE(SUM(usd),0) FROM ledger'):.2f}")
 
 
-COMMANDS = {"tcheck": cmd_tcheck, "check": cmd_check, "run": cmd_run, "count": cmd_count, "tsearch": cmd_tsearch,
+COMMANDS = {"tcheck": cmd_tcheck, "tdiag": cmd_tdiag, "check": cmd_check, "run": cmd_run, "count": cmd_count, "tsearch": cmd_tsearch,
             "sample": cmd_sample, "tbaseline": cmd_tbaseline, "tany": cmd_tany, "weights": cmd_weights,
             "coverage": cmd_coverage, "export": cmd_export, "status": cmd_status}
 
@@ -879,13 +927,17 @@ COMMANDS = {"tcheck": cmd_tcheck, "check": cmd_check, "run": cmd_run, "count": c
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=list(COMMANDS) + ["purge"])
+    ap.add_argument("args", nargs="*")
     ap.add_argument("--yes", action="store_true")
     a = ap.parse_args()
     if a.command == "purge":
         return cmd_purge(a.yes)
     cfg, con, env = load_config(), raw_db(), load_env()
     try:
-        COMMANDS[a.command](env, con, cfg)
+        if a.command == "tdiag":
+            cmd_tdiag(env, con, cfg, a.args)
+        else:
+            COMMANDS[a.command](env, con, cfg)
     except BudgetExceeded as e:
         print(e)
     except KeyboardInterrupt:
