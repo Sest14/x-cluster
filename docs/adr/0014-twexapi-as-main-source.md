@@ -12,7 +12,7 @@
 
 ## 決定
 **データ源**
-- 投稿とプロフィールは TwexAPI の advanced_search で集める。時間の範囲は `since_time:`/`until_time:`（UNIX時刻）で指定する（`tcheck` で動作を確認し、だめなら `since:..._UTC` 形式に切り替える）。
+- 投稿とプロフィールは TwexAPI の advanced_search で集める。時間の範囲は `since_time:`/`until_time:`（UNIX時刻）で指定する。2026-11-19 の `tcheck` で、この形式は指定した1時間の枠内の投稿だけを返し、`since:..._UTC` 形式は0件だったことを確認した。応答の項目名（`id`、`full_text`、`created_at_datetime`、`in_reply_to_user_id`、`quoted_status_id_str`、投稿者の `screen_name` など）もドキュメントどおりだった。
 - 公式 X API は、(1) 日別の件数（`count`）、(2) 網羅性の検査（`coverage`）、(3) 抽出で選んだ群の重み（`weights`）にだけ使う。見積もりは合計5〜10ドル。
 
 **集め方の変更**
