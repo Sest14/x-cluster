@@ -235,6 +235,14 @@ class Twex:
         self.max_credits = int(cfg.get("twex_max_credits", 0))
         self.last = 0.0
         self.n429 = 0
+        self.n_req = 0
+        self.t0 = time.time()
+
+    def pace(self):
+        """Human-readable pacing info for progress lines."""
+        mins = max(1e-9, (time.time() - self.t0) / 60)
+        return (f"{self.n_req / mins:.0f}回/分（間隔 {self.min_interval:.1f}秒、429 累計 {self.n429} 回）"
+                f"  クレジット使用 {self.used():,}")
 
     def used(self):
         return self.con.execute("SELECT COALESCE(SUM(credits),0) FROM twex_ledger").fetchone()[0]
@@ -279,6 +287,7 @@ class Twex:
                 raise SystemExit(f"TwexAPI エラー code={code} msg={d.get('msg')}")
             # success: speed back up gradually toward the plan's rate
             self.min_interval = max(self.base_interval, self.min_interval * 0.95)
+            self.n_req += 1
             return d
         raise SystemExit(f"TwexAPI: 再試行しても失敗しました: {path}")
 
@@ -511,8 +520,11 @@ def cmd_tsearch(env, con, cfg):
                 con.execute("UPDATE tsearch_state SET n=?, cursor=?, done=? WHERE query_name=? AND start=?",
                             (got, cursor, done, q["name"], s))
                 con.commit()
+                if tw.n_req % 25 == 0:
+                    print(f"  [{q['name']}] {s[:10]} 取得中 {got:,} 件  {tw.pace()}")
                 if done:
                     break
+            print(f"  [{q['name']}] {s[:10]} 完了 {got:,} 件（公式 {quota:,} 件）  {tw.pace()}")
         tot = con.execute("SELECT COALESCE(SUM(n),0), COALESCE(SUM(quota),0) FROM tsearch_state WHERE query_name=?",
                           (q["name"],)).fetchone()
         print(f"[{q['name']}] TwexAPI {tot[0]:,} 件（公式の件数{'（全件）' if mode == 'all' else 'に比例した目標'} {tot[1]:,} 件）"
@@ -568,8 +580,8 @@ def cmd_tbaseline(env, con, cfg):
         con.execute("INSERT OR REPLACE INTO baseline_state VALUES(?,?,?,?,?,?)",
                     (uid, window, got, more, "ok" if got else "empty", now()))
         con.commit()
-        if i % 50 == 0 or i == len(todo):
-            print(f"ふだんの投稿 {i:,}/{len(todo):,}  クレジット使用 {tw.used():,}")
+        if i % 25 == 0 or i == len(todo):
+            print(f"ふだんの投稿 {i:,}/{len(todo):,}  {tw.pace()}")
 
 
 def cmd_tany(env, con, cfg):
@@ -592,7 +604,7 @@ def cmd_tany(env, con, cfg):
                     (uid, len(data), int(bool(cursor)), now()))
         con.commit()
         if i % 50 == 0 or i == len(todo):
-            print(f"言及の確認 {i:,}/{len(todo):,}  クレジット使用 {tw.used():,}")
+            print(f"言及の確認 {i:,}/{len(todo):,}  {tw.pace()}")
 
 
 def cmd_weights(env, con, cfg):
