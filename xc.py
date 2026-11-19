@@ -229,15 +229,18 @@ class Twex:
         if not key:
             raise SystemExit(".env に TWEX_API_KEY がありません。TwexAPI のダッシュボードで発行したキーを書いてください。")
         self.key, self.con, self.cfg = key, con, cfg
-        self.min_interval = 1.0 / float(cfg.get("twex_qps", 1))
+        # adaptive pacing: start slightly slower than the plan's QPS, back off on 429, creep back on success
+        self.base_interval = 1.15 / float(cfg.get("twex_qps", 1))
+        self.min_interval = self.base_interval
         self.max_credits = int(cfg.get("twex_max_credits", 0))
         self.last = 0.0
+        self.n429 = 0
 
     def used(self):
         return self.con.execute("SELECT COALESCE(SUM(credits),0) FROM twex_ledger").fetchone()[0]
 
     def _req(self, method, path, body=None):
-        for attempt in range(8):
+        for attempt in range(60):  # 429s are retried with growing intervals; other errors give up much sooner
             wait = self.last + self.min_interval - time.time()
             if wait > 0:
                 time.sleep(wait)
@@ -252,7 +255,10 @@ class Twex:
                     d = json.load(r)
             except urllib.error.HTTPError as e:
                 msg = e.read().decode("utf-8", "replace")[:600]
-                if e.code == 429 or e.code >= 500:
+                if e.code == 429:
+                    self._slow_down(e.headers.get("Retry-After"))
+                    continue
+                if e.code >= 500 and attempt < 8:
                     print(f"  TwexAPI {e.code}: {10 * (attempt + 1)}秒待って再試行します…")
                     time.sleep(10 * (attempt + 1))
                     continue
@@ -268,11 +274,25 @@ class Twex:
             code = d.get("code") if isinstance(d, dict) else None
             if code not in (None, 200):
                 if code == 429:
-                    time.sleep(10 * (attempt + 1))
+                    self._slow_down(None)
                     continue
                 raise SystemExit(f"TwexAPI エラー code={code} msg={d.get('msg')}")
+            # success: speed back up gradually toward the plan's rate
+            self.min_interval = max(self.base_interval, self.min_interval * 0.95)
             return d
         raise SystemExit(f"TwexAPI: 再試行しても失敗しました: {path}")
+
+    def _slow_down(self, retry_after):
+        self.n429 += 1
+        self.min_interval = min(self.min_interval * 1.6, 12.0)
+        try:
+            wait = float(retry_after) if retry_after else self.min_interval * 2
+        except ValueError:
+            wait = self.min_interval * 2
+        if self.n429 == 1 or self.n429 % 20 == 0:
+            print(f"  TwexAPI の回数制限（429、累計 {self.n429} 回）。間隔を {self.min_interval:.1f} 秒に広げて続けます。"
+                  " 何度も出る場合は config.json の twex_qps をプランに合わせてください（無料枠 0.2、Mini 1）。")
+        time.sleep(wait)
 
     def balance(self):
         return self._req("GET", "/balance")
