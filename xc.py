@@ -265,7 +265,7 @@ class Twex:
             except urllib.error.HTTPError as e:
                 msg = e.read().decode("utf-8", "replace")[:600]
                 if e.code == 429:
-                    self._slow_down(e.headers.get("Retry-After"))
+                    self._slow_down(e.headers.get("Retry-After"), msg)
                     continue
                 if e.code >= 500 and attempt < 8:
                     print(f"  TwexAPI {e.code}: {10 * (attempt + 1)}秒待って再試行します…")
@@ -283,7 +283,7 @@ class Twex:
             code = d.get("code") if isinstance(d, dict) else None
             if code not in (None, 200):
                 if code == 429:
-                    self._slow_down(None)
+                    self._slow_down(None, d.get("msg"))
                     continue
                 raise SystemExit(f"TwexAPI エラー code={code} msg={d.get('msg')}")
             # success: speed back up gradually toward the plan's rate
@@ -292,7 +292,7 @@ class Twex:
             return d
         raise SystemExit(f"TwexAPI: 再試行しても失敗しました: {path}")
 
-    def _slow_down(self, retry_after):
+    def _slow_down(self, retry_after, msg=None):
         self.n429 += 1
         self.min_interval = min(self.min_interval * 1.6, 12.0)
         try:
@@ -301,7 +301,7 @@ class Twex:
             wait = self.min_interval * 2
         if self.n429 == 1 or self.n429 % 20 == 0:
             print(f"  TwexAPI の回数制限（429、累計 {self.n429} 回）。間隔を {self.min_interval:.1f} 秒に広げて続けます。"
-                  " 何度も出る場合は config.json の twex_qps をプランに合わせてください（無料枠 0.2、Mini 1）。")
+                  f"\n    TwexAPI からのメッセージ: {(msg or '').strip()[:200]}")
         time.sleep(wait)
 
     def balance(self):
