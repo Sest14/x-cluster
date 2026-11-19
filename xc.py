@@ -665,8 +665,12 @@ def cmd_coverage(env, con, cfg):
 def cmd_tdiag(env, con, cfg, args=()):
     """Coverage diagnosis for one query and day: official hourly counts vs TwexAPI with
     (A) one 6-hour window and (B) six 1-hour windows. Usage: py xc.py tdiag regista 2026-11-05"""
+    if args and args[0] == "from":
+        return tdiag_from(env, con, cfg, int(args[1]) if len(args) > 1 else 10)
     qname = args[0] if args else cfg["queries"][0]["name"]
     day = args[1] if len(args) > 1 else None
+    if len(args) > 2 and args[2] == "10min":
+        return tdiag_10min(env, con, cfg, qname, day)
     q = next(x for x in cfg["queries"] if x["name"] == qname)
     if not day:
         day = con.execute("SELECT start FROM daily_counts WHERE query_name=? ORDER BY n DESC LIMIT 1",
@@ -706,6 +710,65 @@ def cmd_tdiag(env, con, cfg, args=()):
         print(f"    {h}時台: {len(ids):,} 件（公式 {hourly[h] if h < len(hourly) else '?'}、{pages} ページ、{why}）")
     print(f"(B) 1時間の枠6つ: {len(b):,} 件  {tw.pace()}")
     print(f"取れた割合: (A) {len(a) / max(1, sum(hourly)):.0%}  (B) {len(b) / max(1, sum(hourly)):.0%}")
+    con.commit()
+
+
+def tdiag_pull(tw, term, s, e, cfg, cap=None):
+    ids, cursor, pages = set(), None, 0
+    while True:
+        data, cursor = tw.search_page(f"{term} {window_ops(cfg, s.isoformat(), e.isoformat())}", cursor)
+        pages += 1
+        ids |= {str(t.get("id") or t.get("tweet_id")) for t in data}
+        if not data or not cursor or (cap and len(ids) >= cap):
+            return ids, pages
+
+
+def tdiag_10min(env, con, cfg, qname, day):
+    """Coverage of the first hour of a day split into six 10-minute windows."""
+    q = next(x for x in cfg["queries"] if x["name"] == qname)
+    start = dt.datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
+    cl = Client(env["X_BEARER_TOKEN"], con, cfg)
+    tw = Twex(env["TWEX_API_KEY"], con, cfg)
+    term = web_query(q["query"])
+    tot_o, tot_t = 0, 0
+    for k in range(6):
+        s = start + dt.timedelta(minutes=10 * k)
+        e = s + dt.timedelta(minutes=10)
+        d = cl.get("/tweets/counts/all", {"query": q["query"], "granularity": "minute",
+                                          "start_time": iso(s.isoformat()), "end_time": iso(e.isoformat())}, 0.02)
+        cl.charge("counts/all(diag)", "count_all_request", 1)
+        o = sum(int(b.get("tweet_count", 0)) for b in d.get("data", []))
+        ids, pages = tdiag_pull(tw, term, s, e, cfg)
+        tot_o, tot_t = tot_o + o, tot_t + len(ids)
+        print(f"  {s:%H:%M}〜{e:%H:%M}: TwexAPI {len(ids)} 件 / 公式 {o} 件（{pages} ページ）")
+        time.sleep(1.1)
+    print(f"10分区切り: {tot_t} / {tot_o} 件（{tot_t / max(1, tot_o):.0%}）  {tw.pace()}")
+    con.commit()
+
+
+def tdiag_from(env, con, cfg, n):
+    """Coverage of 'from:account' searches in the baseline window, for n random seed authors."""
+    cl = Client(env["X_BEARER_TOKEN"], con, cfg)
+    tw = Twex(env["TWEX_API_KEY"], con, cfg)
+    rng = random.Random(99)
+    rows = con.execute("SELECT DISTINCT u.id, u.username FROM users u JOIN posts p ON p.author_id=u.id "
+                       "JOIN seed_hits s ON s.post_id=p.id WHERE u.username IS NOT NULL AND COALESCE(u.protected,0)=0 "
+                       "ORDER BY u.id").fetchall()
+    bs, be = to_dt(cfg["baseline_start"]), to_dt(cfg["baseline_end"])
+    tot_o, tot_t, k = 0, 0, 0
+    for uid, sn in rng.sample(rows, min(n * 3, len(rows))):
+        o = sum(b[2] for b in count_query(cl, cfg, f"from:{uid} -is:retweet", cfg["baseline_start"], cfg["baseline_end"]))
+        if o == 0:
+            continue
+        cap = min(o, 100)
+        ids, pages = tdiag_pull(tw, f"from:{sn} -filter:retweets", bs, be, cfg, cap=cap)
+        got = min(len(ids), cap)
+        tot_o, tot_t, k = tot_o + cap, tot_t + got, k + 1
+        print(f"  アカウント{k}: TwexAPI {got} 件 / 公式 {o} 件（比べた上限 {cap}、{pages} ページ）")
+        if k >= n:
+            break
+    print(f"ふだんの投稿（from:）: {tot_t} / {tot_o} 件（{tot_t / max(1, tot_o):.0%}）  {tw.pace()}"
+          f"  公式API 推定使用額 ${cl.spent():.2f}")
     con.commit()
 
 
