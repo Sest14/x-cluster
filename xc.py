@@ -10,6 +10,9 @@ Usage (Windows):  py xc.py <command> [args] [--yes]
 Commands:
   tcheck     Test the TwexAPI key and the time-window syntax
   tdiag      Coverage diagnostics: tdiag <query> <day> [10min] | tdiag from <n> | tdiag fromid
+  pdiag      Keyword-search coverage of other providers vs official hourly counts:
+             pdiag <socialdata|twitterapi_io|scrapebadger|apify|twex> <query> <day> | pdiag compare <query> <day>
+  sdiag      Same as pdiag socialdata
   check      Test the official X API token (~$0.005)
   run        Do everything below in order (count, search, sample, users, tbaseline, tweights, tany, export)
   count      Official API: daily post counts per query (~$0.01 per query)
@@ -44,6 +47,7 @@ import urllib.request
 BASE = os.path.dirname(os.path.abspath(__file__))
 API = "https://api.x.com/2"
 TWEX_API = "https://api.twexapi.io"
+LOG_DIR = os.path.join(BASE, "logs")
 RAW_DB = os.path.join(BASE, "raw.sqlite")
 OUT_DB = os.path.join(BASE, "analysis.sqlite")
 SALT_FILE = os.path.join(BASE, "salt.secret")
@@ -79,7 +83,8 @@ def load_env():
                     continue
                 k, _, v = line.partition("=")
                 env[k.strip()] = v.strip().strip('"').strip("'")
-    for k in ("X_BEARER_TOKEN", "TWEX_API_KEY"):
+    for k in ("X_BEARER_TOKEN", "TWEX_API_KEY", "SOCIALDATA_API_KEY", "TWITTERAPI_IO_KEY",
+              "SCRAPEBADGER_API_KEY", "APIFY_TOKEN"):
         env.setdefault(k, os.environ.get(k, ""))
     return env
 
@@ -812,6 +817,388 @@ def tdiag_from(env, con, cfg, n):
     con.commit()
 
 
+# ---------------------------------------------------------------- keyword-search coverage across providers (pdiag)
+
+class Provider:
+    """Common pacing and HTTP for third-party search APIs used only by pdiag. Posts are not stored, only IDs."""
+    name, key_env, label = "", "", ""
+    price_per_item = 0.0
+
+    def __init__(self, env, cfg):
+        self.key = env.get(self.key_env) or os.environ.get(self.key_env, "")
+        if not self.key:
+            raise SystemExit(f".env に {self.key_env} がありません。{self.label} で発行したキーを書いてください。")
+        self.interval = float(cfg.get("pdiag_interval", {}).get(self.name, self.default_interval))
+        self.last = 0.0
+        self.n_req = 0
+        self.n_items = 0
+
+    default_interval = 1.0
+
+    def http(self, url, headers, body=None, timeout=120):
+        for attempt in range(10):
+            wait = self.last + self.interval - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            self.last = time.time()
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
+            h = {"Accept": "application/json", "User-Agent": "x_cluster/1.0", **headers}
+            if data is not None:
+                h["Content-Type"] = "application/json"
+            req = urllib.request.Request(url, data=data, headers=h, method="POST" if data is not None else "GET")
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    self.n_req += 1
+                    return json.load(r)
+            except urllib.error.HTTPError as e:
+                msg = e.read().decode("utf-8", "replace")[:300]
+                if e.code == 429:
+                    self.interval = min(self.interval * 1.5 + 1, 60)
+                    print(f"  {self.label} の回数制限（429）。間隔を {self.interval:.0f} 秒に広げて再試行します…")
+                    time.sleep(self.interval)
+                    continue
+                if e.code >= 500 and attempt < 5:
+                    print(f"  {self.label} {e.code}: {10 * (attempt + 1)}秒待って再試行します…")
+                    time.sleep(10 * (attempt + 1))
+                    continue
+                if e.code in (401, 403):
+                    raise SystemExit(f"{self.label} の認証エラー（{e.code}）。.env の {self.key_env} を確認してください。\n{msg}")
+                if e.code == 402:
+                    raise SystemExit(f"{self.label}: 残高不足（402）。ダッシュボードで残高と無料枠の条件を確認してください。\n{msg}")
+                raise SystemExit(f"{self.label} HTTP {e.code}\n{msg}")
+            except urllib.error.URLError as e:
+                print(f"  通信エラー（{e.reason}）。再試行します…")
+                time.sleep(5 * (attempt + 1))
+        raise SystemExit(f"{self.label}: 再試行しても失敗しました")
+
+    def page(self, term, cursor):
+        """Return (list of tweet ids, next cursor or None)."""
+        raise NotImplementedError
+
+    def window(self, term, s, e, official_n):
+        w = f"since_time:{int(s.timestamp())} until_time:{int(e.timestamp())}"
+        ids, cursor, pages = set(), None, 0
+        while True:
+            got, cursor = self.page(f"{term} {w}", cursor)
+            pages += 1
+            new = set(got) - ids
+            ids |= new
+            self.n_items += len(got)
+            if not got:
+                return ids, pages, "空のページで終了"
+            if not cursor:
+                return ids, pages, "次のページなしで終了"
+            if not new:
+                return ids, pages, "新しい投稿が返らなくなり終了"
+
+    def pace(self):
+        return f"リクエスト {self.n_req} 回、取得 {self.n_items:,} 件（有料なら約 ${self.n_items * self.price_per_item:.2f}）"
+
+
+class PSocialData(Provider):
+    name, key_env, label, price_per_item, default_interval = (
+        "socialdata", "SOCIALDATA_API_KEY", "SocialData", 0.0002, 21.0)  # free: 3 requests/minute
+
+    def page(self, term, cursor):
+        p = {"query": term, "type": "Latest"}
+        if cursor:
+            p["cursor"] = cursor
+        d = self.http(f"https://api.socialdata.tools/twitter/search?{urllib.parse.urlencode(p)}",
+                      {"Authorization": f"Bearer {self.key}"})
+        return [str(t.get("id_str") or t.get("id")) for t in d.get("tweets") or []], d.get("next_cursor") or None
+
+
+class PTwitterApiIo(Provider):
+    name, key_env, label, price_per_item, default_interval = (
+        "twitterapi_io", "TWITTERAPI_IO_KEY", "TwitterAPI.io", 0.00015, 5.5)  # free credits: ~1 request / 5 s
+
+    def page(self, term, cursor):
+        p = {"query": term, "queryType": "Latest", "cursor": cursor or ""}
+        d = self.http(f"https://api.twitterapi.io/twitter/tweet/advanced_search?{urllib.parse.urlencode(p)}",
+                      {"X-API-Key": self.key})
+        nxt = d.get("next_cursor") if d.get("has_next_page") else None
+        return [str(t.get("id")) for t in d.get("tweets") or []], nxt or None
+
+
+class PScrapeBadger(Provider):
+    name, key_env, label, price_per_item, default_interval = (
+        "scrapebadger", "SCRAPEBADGER_API_KEY", "ScrapeBadger", 0.0001, 1.0)
+
+    def page(self, term, cursor):
+        p = {"query": term, "query_type": "Latest", "count": 100}
+        if cursor:
+            p["cursor"] = cursor
+        d = self.http(f"https://scrapebadger.com/v1/twitter/tweets/advanced_search?{urllib.parse.urlencode(p)}",
+                      {"x-api-key": self.key})
+        return [str(t.get("id")) for t in d.get("data") or []], d.get("next_cursor") or None
+
+
+class PApify(Provider):
+    """Apify actor run synchronously; one call per window (the actor pages internally)."""
+    name, key_env, label, price_per_item, default_interval = (
+        "apify", "APIFY_TOKEN", "Apify", 0.00025, 2.0)
+
+    def window(self, term, s, e, official_n):
+        actor = self.cfg_actor
+        w = f"since_time:{int(s.timestamp())} until_time:{int(e.timestamp())}"
+        cap = max(100, official_n * 2)
+        body = {"searchTerms": [f"{term} {w}"], "searchMode": "Latest", "maxItems": cap, "includeReplies": True}
+        items = self.http(f"https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items?"
+                          f"{urllib.parse.urlencode({'token': self.key, 'timeout': 280})}", {}, body, timeout=300)
+        if isinstance(items, dict):  # error object
+            raise SystemExit(f"Apify: {str(items)[:300]}")
+        ids = {str(t.get("id")) for t in items if isinstance(t, dict) and t.get("id")}
+        self.n_items += len(items)
+        why = f"上限 {cap} 件に到達" if len(items) >= cap else "実行完了"
+        return ids, 1, why
+
+
+PROVIDERS = {p.name: p for p in (PSocialData, PTwitterApiIo, PScrapeBadger, PApify)}
+
+
+class PTwex(Provider):
+    """Wrap the existing TwexAPI client so it can be compared in the same table."""
+    name, label = "twex", "TwexAPI"
+
+    def __init__(self, env, cfg, con):
+        self.tw = Twex(env["TWEX_API_KEY"], con, cfg)
+        self.n_req, self.n_items = 0, 0
+
+    def page(self, term, cursor):
+        data, nxt = self.tw.search_page(term, cursor)
+        self.n_req += 1
+        return [str(t.get("id") or t.get("tweet_id")) for t in data], nxt
+
+    def pace(self):
+        return self.tw.pace()
+
+
+def pdiag_tables(con):
+    con.execute("PRAGMA busy_timeout=30000")  # several pdiag runs may write at once
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS diag_counts(query_name TEXT, window_start TEXT, n INTEGER,
+        PRIMARY KEY(query_name, window_start));
+    CREATE TABLE IF NOT EXISTS diag_ids(provider TEXT, query_name TEXT, window_start TEXT, post_id TEXT,
+        PRIMARY KEY(provider, query_name, window_start, post_id));
+    CREATE TABLE IF NOT EXISTS diag_official(query_name TEXT, window_start TEXT, post_id TEXT, author_id TEXT,
+        is_reply INTEGER, PRIMARY KEY(query_name, post_id));
+    CREATE TABLE IF NOT EXISTS diag_runs(provider TEXT, query_name TEXT, window_start TEXT, n_got INTEGER,
+        pages INTEGER, why TEXT, ts TEXT, PRIMARY KEY(provider, query_name, window_start));
+    """)
+
+
+def pdiag_hourly(env, con, cfg, q, start):
+    """Official hourly counts for UTC 0-6h of the day; cached so parallel runs pay once (~$0.01)."""
+    keys = [iso((start + dt.timedelta(hours=h)).isoformat()) for h in range(6)]
+    rows = dict(con.execute(f"SELECT window_start, n FROM diag_counts WHERE query_name=? AND window_start IN "
+                            f"({','.join('?' * 6)})", (q["name"], *keys)).fetchall())
+    if len(rows) == 6:
+        return [rows[k] for k in keys]
+    cl = Client(env["X_BEARER_TOKEN"], con, cfg)
+    d = cl.get("/tweets/counts/all", {"query": q["query"], "granularity": "hour", "start_time": keys[0],
+                                      "end_time": iso((start + dt.timedelta(hours=6)).isoformat())}, 0.02)
+    cl.charge("counts/all(pdiag)", "count_all_request", 1)
+    hourly = [int(b.get("tweet_count", 0)) for b in d.get("data", [])][:6]
+    hourly += [0] * (6 - len(hourly))
+    con.executemany("INSERT OR REPLACE INTO diag_counts VALUES(?,?,?)",
+                    [(q["name"], k, n) for k, n in zip(keys, hourly)])
+    con.commit()
+    return hourly
+
+
+PDIAG_VARIANTS = {  # name: (official API suffix, web-search suffix)
+    "all": ("", ""),
+    "noreply": (" -is:reply", " -filter:replies"),
+    "reply": (" is:reply", " filter:replies"),
+}
+
+
+def pdiag_target(con, cfg, args, variant="all"):
+    """Returns (query dict for this variant, web-search term, day, start). The variant gets its own
+    query_name (e.g. regista:noreply) so counts and IDs are kept apart from the plain run."""
+    qname = args[0] if args else cfg["queries"][0]["name"]
+    q = next((x for x in cfg["queries"] if x["name"] == qname), None)
+    if q is None:
+        raise SystemExit(f"config.json に {qname} という検索条件がありません。")
+    if len(args) < 2:
+        raise SystemExit("日付を指定してください（例: py xc.py pdiag socialdata regista 2026-11-05）")
+    if variant not in PDIAG_VARIANTS:
+        raise SystemExit(f"不明な絞り込み: {variant}（{', '.join(PDIAG_VARIANTS)}, split）")
+    o_suffix, w_suffix = PDIAG_VARIANTS[variant]
+    qv = {**q, "query": q["query"] + o_suffix,
+          "name": q["name"] if variant == "all" else f"{q['name']}:{variant}"}
+    term = web_query(q["query"]) + w_suffix
+    return qv, term, args[1], dt.datetime.strptime(args[1], "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
+
+
+def cmd_pdiag(env, con, cfg, args=()):
+    """Keyword-search coverage of one provider: six 1-hour windows (UTC 0-6h) vs official hourly counts.
+    Usage: py xc.py pdiag <socialdata|twitterapi_io|scrapebadger|apify|twex> <query> <day> [all|noreply|reply|split]
+           py xc.py pdiag compare <query> <day> [all|noreply|reply]
+           py xc.py pdiag who <query> <day>   (per-account or per-post? official posts with author IDs, ~$2)
+    split = run noreply, then reply, and print how coverage differs between them."""
+    pdiag_tables(con)
+    if not args:
+        raise SystemExit("使い方: py xc.py pdiag <サービス> <検索条件> <日付>  /  py xc.py pdiag compare <検索条件> <日付>\n"
+                         f"サービス: {', '.join(list(PROVIDERS) + ['twex'])}")
+    if args[0] == "compare":
+        return pdiag_compare(con, cfg, args[1:3], args[3] if len(args) > 3 else "all")
+    if args[0] == "who":
+        return pdiag_who(env, con, cfg, args[1:3])
+    pname = args[0]
+    if pname == "twex":
+        prov = PTwex(env, cfg, con)
+    elif pname in PROVIDERS:
+        prov = PROVIDERS[pname](env, cfg)
+        prov.cfg_actor = cfg.get("apify_actor", "jacquemus~x-tweet-scraper")
+    else:
+        raise SystemExit(f"不明なサービス: {pname}（{', '.join(list(PROVIDERS) + ['twex'])}）")
+    variant = args[3] if len(args) > 3 else "all"
+    if variant == "split":
+        res = {v: pdiag_run(env, con, cfg, prov, pname, args[1:3], v) for v in ("noreply", "reply")}
+        print("返信の有無で分けた取得率:")
+        for v, (got, n) in res.items():
+            print(f"  {'返信以外' if v == 'noreply' else '返信'}: {got:,} / {n:,} 件（{got / max(1, n):.0%}）")
+        return
+    pdiag_run(env, con, cfg, prov, pname, args[1:3], variant)
+
+
+def pdiag_run(env, con, cfg, prov, pname, targs, variant):
+    q, term, day, start = pdiag_target(con, cfg, targs, variant)
+    hourly = pdiag_hourly(env, con, cfg, q, start)
+    print(f"[{prov.label}] [{q['name']}] {day} 0〜6時（UTC）の公式の件数: {sum(hourly):,}（1時間ごと {hourly}）")
+    total = set()
+    for h in range(6):
+        s = start + dt.timedelta(hours=h)
+        ws = iso(s.isoformat())
+        ids, pages, why = prov.window(term, s, s + dt.timedelta(hours=1), hourly[h])
+        con.execute("DELETE FROM diag_ids WHERE provider=? AND query_name=? AND window_start=?", (pname, q["name"], ws))
+        con.executemany("INSERT OR IGNORE INTO diag_ids VALUES(?,?,?,?)", [(pname, q["name"], ws, i) for i in ids])
+        con.execute("INSERT OR REPLACE INTO diag_runs VALUES(?,?,?,?,?,?,?)",
+                    (pname, q["name"], ws, len(ids), pages, why, now()))
+        con.commit()
+        total |= ids
+        print(f"    {h}時台: {len(ids):,} 件 / 公式 {hourly[h]:,} 件（{len(ids) / max(1, hourly[h]):.0%}、{pages} ページ、{why}）")
+    n = sum(hourly)
+    print(f"{prov.label}（1時間の枠6つ）: {len(total):,} / {n:,} 件（{len(total) / max(1, n):.0%}）  {prov.pace()}")
+    return len(total), n
+
+
+def pdiag_compare(con, cfg, args, variant="all"):
+    q, _term, day, start = pdiag_target(con, cfg, args, variant)
+    keys = [iso((start + dt.timedelta(hours=h)).isoformat()) for h in range(6)]
+    ph = ",".join("?" * 6)
+    official = con.execute(f"SELECT COALESCE(SUM(n),0), COUNT(*) FROM diag_counts WHERE query_name=? "
+                           f"AND window_start IN ({ph})", (q["name"], *keys)).fetchone()
+    if official[1] < 6:
+        raise SystemExit("公式の件数がまだありません。先にどれかのサービスで pdiag を実行してください。")
+    n = official[0]
+    done = [r[0] for r in con.execute(f"SELECT provider FROM diag_runs WHERE query_name=? AND window_start IN ({ph}) "
+                                      f"GROUP BY provider HAVING COUNT(*)=6 ORDER BY provider", (q["name"], *keys))]
+    sets = {p: {r[0] for r in con.execute(f"SELECT post_id FROM diag_ids WHERE provider=? AND query_name=? "
+                                          f"AND window_start IN ({ph})", (p, q["name"], *keys))} for p in done}
+    if not sets:
+        raise SystemExit("6つの枠すべてを終えたサービスがまだありません。")
+    union = set().union(*sets.values())
+    common = set.intersection(*sets.values())
+    print(f"[{q['name']}] {day} 0〜6時（UTC） 公式の件数: {n:,}")
+    print(f"{'サービス':<16}{'取得':>7}{'取得率':>8}{'他にない投稿':>12}")
+    for p, s in sets.items():
+        others = set().union(*(v for k, v in sets.items() if k != p)) if len(sets) > 1 else set()
+        print(f"{p:<16}{len(s):>7,}{len(s) / max(1, n):>8.0%}{len(s - others):>12,}")
+    print(f"全サービスの和集合: {len(union):,} 件（{len(union) / max(1, n):.0%}）")
+    print(f"全サービス共通:     {len(common):,} 件")
+    if len(sets) > 1:
+        print("2社ずつの重なり（共通 / 和集合）:")
+        names = list(sets)
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                a, b = sets[names[i]], sets[names[j]]
+                print(f"  {names[i]} × {names[j]}: {len(a & b):,} / {len(a | b):,}（{len(a & b) / max(1, len(a | b)):.0%}）")
+    print("判定（事前に決めたルール）: 80%以上 → 起点の収集をそのサービスに切り替える案を検討 / "
+          "どのサービスも20%前後で同じ投稿 → X 側の除外と確定し ADR-0015 のまま / その間 → 相談")
+
+
+def pdiag_who(env, con, cfg, args):
+    """Is the ~20% visibility decided per account or per post? Fetch every official post in UTC 0-6h
+    (IDs, author IDs and reply flag only; no text, about $0.005 per post), then look at each author:
+    all visible / none visible / mixed. Under per-post sampling, mixed authors should be common;
+    under per-account exclusion, they should be rare. Aggregates only (ADR-0004)."""
+    q, _term, day, start = pdiag_target(con, cfg, args)
+    keys = [iso((start + dt.timedelta(hours=h)).isoformat()) for h in range(6)]
+    ph = ",".join("?" * 6)
+    have = con.execute(f"SELECT COUNT(*) FROM diag_official WHERE query_name=? AND window_start IN ({ph})",
+                       (q["name"], *keys)).fetchone()[0]
+    if not have:
+        hourly = pdiag_hourly(env, con, cfg, q, start)
+        cl = Client(env["X_BEARER_TOKEN"], con, cfg)
+        price = cl.prices.get("post", 0)
+        print(f"公式APIで {sum(hourly):,} 件を取得します（推定 ${sum(hourly) * price:.2f}、本文は保存しません）")
+        for k in keys:
+            e = iso((dt.datetime.fromisoformat(k.replace("Z", "+00:00")) + dt.timedelta(hours=1)).isoformat())
+            token = None
+            while True:
+                params = {"query": q["query"], "max_results": 100, "start_time": k, "end_time": e,
+                          "tweet.fields": "author_id,referenced_tweets,in_reply_to_user_id"}
+                if token:
+                    params["next_token"] = token
+                d = cl.get("/tweets/search/all", params, 100 * price)
+                data = d.get("data", [])
+                cl.charge("search/all(pdiag who)", "post", len(data))
+                con.executemany("INSERT OR IGNORE INTO diag_official VALUES(?,?,?,?,?)", [
+                    (q["name"], k, t["id"], t.get("author_id"),
+                     int(any(r.get("type") == "replied_to" for r in t.get("referenced_tweets") or [])))
+                    for t in data])
+                con.commit()
+                token = d.get("meta", {}).get("next_token")
+                time.sleep(1.1)  # full-archive search: 1 request/sec
+                if not token:
+                    break
+        print(f"公式API 推定使用額 ${cl.spent():.2f}")
+    official = con.execute(f"SELECT post_id, author_id, is_reply FROM diag_official WHERE query_name=? "
+                           f"AND window_start IN ({ph})", (q["name"], *keys)).fetchall()
+    visible = {r[0] for r in con.execute(f"SELECT DISTINCT post_id FROM diag_ids WHERE query_name=? "
+                                         f"AND window_start IN ({ph})", (q["name"], *keys))}
+    if not visible:
+        raise SystemExit("他社サービスの結果がまだありません。先に pdiag <サービス> を実行してください。")
+    o_ids = {r[0] for r in official}
+    p = len(visible & o_ids) / max(1, len(o_ids))
+    print(f"[{q['name']}] {day} 0〜6時（UTC） 公式の投稿 {len(o_ids):,} 件 / 他社で見えた投稿（全社の和集合） "
+          f"{len(visible & o_ids):,} 件（{p:.0%}）  公式に無い他社の投稿 {len(visible - o_ids):,} 件")
+    by_author = {}
+    for pid, aid, _r in official:
+        a = by_author.setdefault(aid, [0, 0])
+        a[0] += 1
+        a[1] += pid in visible
+    print(f"投稿者 {len(by_author):,} 人")
+    print(f"{'投稿数':<10}{'人数':>6}{'全部見える':>10}{'全部見えない':>12}{'混在':>6}{'混在の期待値（投稿単位で無作為なら）':>22}")
+    groups = [("1件", 1, 1), ("2件", 2, 2), ("3〜4件", 3, 4), ("5件以上", 5, 10 ** 9)]
+    tot_mixed = tot_exp = 0.0
+    for label, lo, hi in groups:
+        g = [v for v in by_author.values() if lo <= v[0] <= hi]
+        allv = sum(1 for n, s in g if s == n)
+        none = sum(1 for n, s in g if s == 0)
+        mixed = len(g) - allv - none
+        exp = sum(1 - p ** n - (1 - p) ** n for n, _ in g) if lo >= 2 else 0
+        if lo >= 2:
+            tot_mixed += mixed
+            tot_exp += exp
+        exp_s = f"{exp:.1f}" if lo >= 2 else "-"
+        print(f"{label:<10}{len(g):>6}{allv:>10}{none:>12}{mixed:>6}{exp_s:>22}")
+    multi = [v for v in by_author.values() if v[0] >= 2]
+    print(f"2件以上の投稿者 {len(multi)} 人: 混在 {tot_mixed:.0f} 人 / 投稿単位で無作為な場合の期待値 {tot_exp:.1f} 人")
+    reply_n = sum(r[2] for r in official)
+    reply_v = sum(1 for r in official if r[2] and r[0] in visible)
+    print(f"参考: 返信 {reply_v}/{reply_n} 件見える、返信以外 {len(visible & o_ids) - reply_v}/{len(o_ids) - reply_n} 件見える")
+    print("判定の目安: 混在が期待値に近い → 投稿単位の抽出（アカウントは関係ない） / "
+          "混在がほぼ0で「全部見えない」人が多い → アカウント単位の除外 / その間 → 両方が混ざっている")
+
+
+def cmd_sdiag(env, con, cfg, args=()):
+    """Kept for compatibility: same as pdiag socialdata."""
+    return cmd_pdiag(env, con, cfg, ("socialdata", *args))
+
+
 def cmd_run(env, con, cfg):
     print("収集を始めます。Ctrl+C で中断しても、同じコマンドで続きから再開します。PCはつけたままにしてください。\n")
     if need_counts(con, cfg):
@@ -1024,9 +1411,35 @@ def cmd_status(env, con, cfg):
     print(f"公式API 推定使用額:   ${q('SELECT COALESCE(SUM(usd),0) FROM ledger'):.2f}")
 
 
-COMMANDS = {"tcheck": cmd_tcheck, "tdiag": cmd_tdiag, "check": cmd_check, "run": cmd_run, "count": cmd_count,
+COMMANDS = {"tcheck": cmd_tcheck, "tdiag": cmd_tdiag, "sdiag": cmd_sdiag, "pdiag": cmd_pdiag, "check": cmd_check, "run": cmd_run, "count": cmd_count,
             "search": cmd_search, "sample": cmd_sample, "users": cmd_users, "tbaseline": cmd_tbaseline,
             "tweights": cmd_tweights, "tany": cmd_tany, "export": cmd_export, "status": cmd_status}
+
+
+class Tee:
+    """Write everything printed to the screen into a log file as well (logs/<command>_<time>.log)."""
+
+    def __init__(self, stream, f):
+        self.stream, self.f = stream, f
+
+    def write(self, s):
+        self.stream.write(s)
+        self.f.write(s)
+        self.f.flush()
+
+    def flush(self):
+        self.stream.flush()
+        self.f.flush()
+
+
+def start_log(words):
+    os.makedirs(LOG_DIR, exist_ok=True)
+    tag = "_".join(re.sub(r"[^\w.-]", "", w) for w in words)[:80]
+    path = os.path.join(LOG_DIR, f"{dt.datetime.now():%Y%m%d_%H%M%S}_{tag}.log")
+    f = open(path, "w", encoding="utf-8")
+    sys.stdout = Tee(sys.stdout, f)
+    sys.stderr = Tee(sys.stderr, f)
+    return path
 
 
 def main():
@@ -1037,18 +1450,25 @@ def main():
     a = ap.parse_args()
     if a.command == "purge":
         return cmd_purge(a.yes)
+    log_path = start_log([a.command, *a.args])
+    print(f"# {now()}  py xc.py {' '.join([a.command, *a.args])}")
     cfg, con, env = load_config(), raw_db(), load_env()
     try:
-        if a.command == "tdiag":
-            cmd_tdiag(env, con, cfg, a.args)
+        if a.command in ("tdiag", "sdiag", "pdiag"):
+            COMMANDS[a.command](env, con, cfg, a.args)
         else:
             COMMANDS[a.command](env, con, cfg)
     except BudgetExceeded as e:
         print(e)
     except KeyboardInterrupt:
         print("\n中断しました。同じコマンドを再実行すると続きから再開します。")
+    except SystemExit as e:
+        if e.code not in (None, 0):
+            print(e.code)
+        raise SystemExit(1 if e.code not in (None, 0) else 0)
     finally:
         con.commit()
+        print(f"# 終了 {now()}  ログ: {log_path}")
 
 
 if __name__ == "__main__":

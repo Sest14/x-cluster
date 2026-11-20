@@ -19,6 +19,7 @@ X 上の言説と、その発言をしているアカウントを、集団レベ
   X_BEARER_TOKEN=公式 X API の Bearer Token
   TWEX_API_KEY=TwexAPI の APIキー
   ```
+  `pdiag` を使う場合は、試すサービスのキーも追加します（下記）。
 
 ## 実行順
 コマンドプロンプトでこのフォルダに移動してから実行します。ふだんは `run` だけで足ります。
@@ -31,6 +32,7 @@ py xc.py run         … 収集一式（count → search → sample → users �
 py xc.py check       … 公式APIのトークン確認（約$0.005）
 py xc.py tcheck      … TwexAPI のキーと時間指定の確認
 py xc.py tdiag ...   … TwexAPI の網羅性の診断（tdiag from 10 / tdiag fromid / tdiag regista 2026-11-05 [10min]）
+py xc.py pdiag ...   … 他社のキーワード検索の網羅性の診断（下記）
 py xc.py count       … 公式API：検索条件ごとの日別件数
 py xc.py search      … 公式API：起点の投稿を日別比例で集める
 py xc.py sample      … 起点の投稿者から各群のアカウントを無作為抽出
@@ -44,6 +46,32 @@ py xc.py status      … 現在の件数、使用クレジット、公式APIの�
 
 どのコマンドも途中で止めて（Ctrl+C）、同じコマンドを再実行すれば続きから再開します。
 TwexAPI の使用クレジットが `twex_max_credits`、公式APIの推定使用額が `budget_usd` を超えそうになると自動で止まります。
+
+## 他社サービスの診断（pdiag）
+公式APIの1時間ごとの件数（UTC 0〜6時、約$0.01。1回取れば以後は使い回し）と、各サービスのキーワード検索で取れた件数を比べます。
+サービスごとに別のコマンドプロンプトで同時に実行できます。保存するのは投稿IDだけです。
+```
+py xc.py pdiag socialdata regista 2026-11-05
+py xc.py pdiag twitterapi_io regista 2026-11-05
+py xc.py pdiag scrapebadger regista 2026-11-05
+py xc.py pdiag apify regista 2026-11-05
+py xc.py pdiag twex regista 2026-11-05
+py xc.py pdiag compare regista 2026-11-05   … 取得率、サービス間の重なり、和集合
+```
+末尾に `noreply`（返信以外）・`reply`（返信だけ）・`split`（両方を続けて実行して比べる）を付けると、返信の有無で分けて診断できます（例: `py xc.py pdiag twex regista 2026-11-05 split`）。
+`py xc.py pdiag who regista 2026-11-05` で、見えない投稿がアカウント単位か投稿単位かを調べます（公式APIで投稿IDと投稿者IDだけを取得、約$2）。
+| サービス | .env のキー名 | 間隔の初期値 |
+|---|---|---|
+| socialdata | `SOCIALDATA_API_KEY` | 21秒（無料枠: 毎分3回） |
+| twitterapi_io | `TWITTERAPI_IO_KEY` | 5.5秒 |
+| scrapebadger | `SCRAPEBADGER_API_KEY` | 1秒 |
+| apify | `APIFY_TOKEN` | 1枠1回（アクターは `apify_actor`、初期値 `jacquemus~x-tweet-scraper`） |
+| twex | `TWEX_API_KEY` | `twex_qps` に従う |
+
+間隔は config.json の `pdiag_interval`（例: `{"socialdata": 21}`）で変えられます。
+
+## ログ
+どのコマンドも、画面の出力を `logs/<日時>_<コマンド>.log` にも保存します。
 
 ## 設定（config.json）
 - `queries`：検索条件。`name` はラベル、`query` は公式APIの検索演算子で書く（TwexAPI 用には自動で書き換える）。`max_seed_posts` は起点の投稿の数（日別比例）、`n_accounts` は抽出する人数

@@ -12,3 +12,6 @@ data/
 __pycache__/
 *.pyc
 .venv/
+
+# run logs
+logs/
